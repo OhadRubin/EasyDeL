@@ -9,7 +9,9 @@ RUN pip install poetry
 
 # RUN pip install --no-cache-dir -r requirements.txt
 
-RUN poetry install --only main
+# RUN poetry install --only main
+RUN poetry lock && poetry install --only main
+
 
 COPY . .
 
