@@ -44,7 +44,7 @@ dtype = jnp.bfloat16
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 	pretrained_model_name_or_path,
     # from_torch=True,
-	input_shape=input_shape,
+	# input_shape=input_shape,
 	auto_shard_model=True,
 	sharding_axis_dims=sharding_axis_dims,
 	config_kwargs=dict(
