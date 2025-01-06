@@ -4,6 +4,9 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 
+# Install poetry
+RUN pip install poetry
+
 # RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
