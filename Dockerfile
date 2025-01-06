@@ -9,6 +9,8 @@ RUN pip install poetry
 
 # RUN pip install --no-cache-dir -r requirements.txt
 
+COPY pyproject.toml poetry.lock ./
+
 COPY . .
 
 RUN poetry install --only main
