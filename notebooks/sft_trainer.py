@@ -68,6 +68,7 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 
 # %%
 config = model.config
+params = model.params
 model_use_tie_word_embedding = config.tie_word_embeddings
 model_parameters = FrozenDict({"params": params})
 
