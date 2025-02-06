@@ -1,8 +1,5 @@
-export HF_TOKEN=$(bash -ic 'source ~/.bashrc; echo $HF_TOKEN')
+# export HF_TOKEN=$(bash -ic 'source ~/.bashrc; echo $HF_TOKEN')
+# . ~/venv/bin/activate
 
-. ~/venv/bin/activate
-# pip install datasets
-# pip install --find-links https://download.pytorch.org/whl/torch_stable.html torch==2.3.1+cpu
-# pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
-python notebooks/sft_trainer.py
+# python.310 -m pip install -U "jax[tpu]" "flax[all]" numpy~=1.0 eformer==0.0.4 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 
+# python3.10 -m pip install --upgrade   uvloop==0.21.0 uvicorn==0.32.0 jinja2>=3.1.5 transformers>=4.47.0 prometheus_client>=0.21.0 fastapi>=0.115.2
