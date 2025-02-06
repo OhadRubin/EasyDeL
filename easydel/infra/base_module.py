@@ -19,15 +19,17 @@ import warnings
 from functools import cached_property, partial
 
 import chex
+import flax
+import flax.struct
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
@@ -36,6 +38,7 @@ from .etils import EasyDeLQuantizationMethods
 from .loss_utils import (
 	LOSS_MAPPING,
 	ForCausalLMLoss,
+	ForSequenceClassificationLoss,
 	LossConfig,
 	LossMetrics,
 )
@@ -44,7 +47,6 @@ from .mixins import (
 	EasyBridgeMixin,
 	EasyGenerationMixin,
 )
-from .utils import quantize_linear_layers
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_state import EasyDeLState
@@ -61,8 +63,8 @@ PartitionLike = tp.Optional[
 
 logger = get_logger(__name__)
 
-MO = tp.TypeVar("MO")
 _CP = tp.TypeVar("CP")
+SELF = tp.TypeVar("SELF")
 
 
 class EasyDeLBaseModule(
@@ -112,7 +114,7 @@ class EasyDeLBaseModule(
 		_ = self.model_type
 
 	@property
-	def parameters(self):
+	def parameters(self) -> tp.Dict:
 		from easydel.utils.graph_utils import iter_module_search
 
 		parameters = {}
@@ -155,6 +157,10 @@ class EasyDeLBaseModule(
 		"""Returns the model type."""
 		return self._model_type
 
+	@property
+	def params(self) -> tp.Dict:
+		return nn.split(self)[-1]
+
 	@cached_property
 	def causal_mask(self) -> jnp.ndarray:
 		"""Returns a causal mask from the config."""
@@ -173,6 +179,8 @@ class EasyDeLBaseModule(
 	def loss_function(self):
 		if getattr(self.config, "loss_type", None) is not None:
 			loss_type = self.config.loss_type
+		elif getattr(self, "loss_type", None) is not None:
+			loss_type = self.loss_type
 		else:
 			loss_type = self.__class__.__name__
 			if loss_type not in LOSS_MAPPING:
@@ -200,13 +208,51 @@ class EasyDeLBaseModule(
 		params_state = nn.split(self, nn.Param, ...)[1].flat_state()
 		return jax.tree_util.tree_leaves(params_state)[0].dtype
 
-	def half(self) -> EasyDeLBaseModule:
+	def to_dtype(self: SELF, dtype: jnp.dtype) -> SELF:
+		"""Applies sharding functions to the model's state."""
+		from easydel.utils.graph_utils import iter_module_search
+
+		gdef, state, others = nn.split(self, nn.Param, ...)
+
+		def _map(path, val: nn.VariableState):
+			if val.value is not None:
+				if not path[-1].startswith("quant_"):
+					val.value = val.value.astype(dtype)
+			return val
+
+		state.update(state.map(_map))
+		self = nn.merge(gdef, state, others)
+
+		for path, module in iter_module_search(self):
+			if hasattr(module, "param_dtype"):
+				module.param_dtype = dtype
+		return self
+
+	def half(self: SELF, change_runtime_dtype: bool = True) -> SELF:
+		if change_runtime_dtype:
+			self = self._reformat_runtime_dtype(jnp.float16)
 		return self._reformat_dtype(jnp.float16)
 
-	def float(self) -> EasyDeLBaseModule:
+	def float(self: SELF, change_runtime_dtype: bool = True) -> SELF:
+		if change_runtime_dtype:
+			self = self._reformat_runtime_dtype(jnp.float32)
 		return self._reformat_dtype(jnp.float32)
 
-	def _reformat_dtype(self, dtype) -> EasyDeLBaseModule:
+	def _reformat_runtime_dtype(self: SELF, dtype) -> SELF:
+		from easydel.utils.graph_utils import iter_module_search
+
+		for path, module in iter_module_search(self):
+			if hasattr(module, "dtype"):
+				if str(type(module.dtype)).endswith(
+					"lax_numpy._ScalarMeta'>"
+				):  # dont change numpy based dtypes
+					module.dtype = dtype
+		self.dtype = dtype
+		return self
+
+	def _reformat_dtype(self: SELF, dtype) -> SELF:
+		from easydel.utils.graph_utils import iter_module_search
+
 		gdef, gtree, others = nn.split(self, nn.Param, ...)
 
 		def _map(array):
@@ -222,9 +268,54 @@ class EasyDeLBaseModule(
 
 		gtree = jax.tree_util.tree_map(_map, gtree)
 		self = nn.merge(gdef, gtree, others)
-		self.dtype = dtype
+
+		for path, module in iter_module_search(self):
+			if hasattr(module, "param_dtype"):
+				if isinstance(module.param_dtype, jnp.dtype):
+					module.param_dtype = dtype
+
 		self.param_dtype = dtype
 		return self
+
+	def _match_partition_rules(self, partition_rules: tp.Any = None):
+		return match_partition_rules(
+			rules=self._get_partition_rules(partition_rules),
+			tree=self.graphtree_params_shape,
+		)
+
+	@property
+	def _specs_sharding(self):
+		def _map(array):
+			if hasattr(array, "sharding"):
+				sharding = array.sharding
+				if isinstance(sharding, NamedSharding):
+					return sharding.spec
+			return PartitionSpec()
+
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				_map,
+				nn.to_tree(self),
+			)
+		)
+
+	@property
+	def _shardings(self):
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				lambda x: x.sharding if hasattr(x, "sharding") else PartitionSpec(),
+				nn.to_tree(self),
+			)
+		)
+
+	@property
+	def _named_shardings(self):
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				lambda x: x.sharding if hasattr(x, "sharding") else None,
+				nn.to_tree(self),
+			)
+		)
 
 	def _get_mesh(self, mesh: tp.Optional[Mesh] = None) -> Mesh:
 		"""Retrieves the mesh, either from the provided argument or the config."""
@@ -252,9 +343,9 @@ class EasyDeLBaseModule(
 		return partition_rules
 
 	def _apply_sharding_fns(
-		self,
+		self: SELF,
 		sharding_fns: tp.Mapping[str, tp.Callable],
-	) -> nn.Module:
+	) -> SELF:
 		"""Applies sharding functions to the model's state."""
 		gdef, state, others = nn.split(self, nn.Param, ...)
 		sharding_fns = flatten_dict(sharding_fns)
@@ -270,11 +361,11 @@ class EasyDeLBaseModule(
 		return self
 
 	def shard_model(
-		self,
+		self: SELF,
 		partition_rules: PartitionLike = None,
 		mesh: tp.Optional[Mesh] = None,
 		overlay_fns: tp.Optional[tp.Mapping[str, tp.Callable]] = None,
-	) -> EasyDeLBaseModule:
+	) -> SELF:
 		"""Shards the model's parameters using the specified partitioning rules and mesh.
 
 		Args:
@@ -301,11 +392,11 @@ class EasyDeLBaseModule(
 		return self
 
 	def gather_model(
-		self,
+		self: SELF,
 		partition_rules: PartitionLike = None,
 		mesh: tp.Optional[Mesh] = None,
 		overlay_fns: tp.Optional[tp.Mapping[str, tp.Callable]] = None,
-	) -> EasyDeLBaseModule:
+	) -> SELF:
 		"""Gathers the model's parameters based on the specified partitioning rules and mesh.
 
 		Args:
@@ -354,28 +445,83 @@ class EasyDeLBaseModule(
 			mesh=mesh,
 		)[1]
 
+	def fully_shard(self: SELF, partition_rules: PartitionLike = None) -> SELF:
+		class ShardState(flax.struct.PyTreeNode):
+			graphdef: nn.GraphDef
+			graphstate: nn.GraphState
+
+		gdef, gstate = nn.split(self)
+		mock = ShardState(graphdef=gdef, graphstate=gstate)
+		shardings = jax.tree_util.tree_map(
+			lambda x: NamedSharding(mesh=self.mesh, spec=x),
+			match_partition_rules(
+				self._get_partition_rules(partition_rules), nn.eval_shape(lambda: mock)
+			),
+		)
+
+		@partial(jax.jit, out_shardings=shardings)
+		def _call(cl):
+			return cl
+
+		mock = _call(mock)
+		self = nn.merge(mock.graphdef, mock.graphstate)
+		return self
+
+	def fully_gather(self: SELF) -> SELF:
+		class ShardState(flax.struct.PyTreeNode):
+			graphdef: nn.GraphDef
+			graphstate: nn.GraphState
+
+		gdef, gstate = nn.split(self)
+		mock = ShardState(graphdef=gdef, graphstate=gstate)
+		shardings = jax.tree_util.tree_map(
+			lambda x: NamedSharding(mesh=self.mesh, spec=PartitionSpec()),
+			match_partition_rules(
+				self._get_partition_rules(None), nn.eval_shape(lambda: mock)
+			),
+		)
+
+		@partial(jax.jit, out_shardings=shardings)
+		def _call(cl):
+			return cl
+
+		mock = _call(mock)
+		self = nn.merge(mock.graphdef, mock.graphstate)
+		return self
+
 	def quantize(
-		self,
+		self: SELF,
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 		block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-	) -> EasyDeLBaseModule:
+		quantize_tensors: bool = False,
+		verbose: tp.Optional[bool] = None,
+	) -> SELF:
 		"""Quantizes the model's linear layers.
 
 		Args:
 		    method (EasyDeLQuantizationMethods, optional): The quantization method to use.
 		    block_size (int, optional): The block size for quantization.
 		    quantization_pattern (str, optional): The quantization pattern to use.
-
+				quantize_tensors (bool): whenever to quantize tensors or quantize Linear Layers.`
+				verbose (bool, optional): Verbose quantizing process
 		Returns:
 		    EasyDeLBaseModule: The quantized model.
 		"""
-		return quantize_linear_layers(
-			self,
-			method=method,
-			block_size=block_size,
-			quantization_pattern=quantization_pattern,
-		)
+		from easydel.layers.quantization.quantizers import EasyQuantizer
+
+		quantizer = EasyQuantizer(quantization_method=method, block_size=block_size)
+		if verbose is None:
+			verbose = jax.process_index() == 0
+		if quantize_tensors:
+			...
+		else:
+			self = quantizer.quantize_linears(
+				self,
+				quantization_pattern=quantization_pattern,
+				verbose=verbose,
+			)
+		return self
 
 	def to_state(self) -> EasyDeLState:
 		"""converts current model to a EasyDeLState"""
@@ -392,6 +538,7 @@ class EasyDeLBaseModule(
 			module=self,
 			base_huggingface_module=model_class,
 			config=self.config,
+			dtype=self.param_dtype,
 			**kwargs,
 		)
 		return hf_model
@@ -403,16 +550,28 @@ class EasyDeLBaseModule(
 		return ()
 
 	@classmethod
-	def lazy_init(cls: tp.Type[MO], *args, **kwargs) -> MO:
+	def lazy_init(cls: tp.Type[SELF], *args, **kwargs) -> SELF:
 		return nn.eval_shape(lambda: cls(*args, **kwargs))
 
+	def merge_lora_params(self: SELF, pytree: tp.Dict) -> SELF:
+		from easydel.infra.utils import merge_lora_params
+
+		self = merge_lora_params(self, pytree)
+		return self
+
+	def split_lora_params(self: SELF) -> tp.Dict:
+		from easydel.infra.utils import split_lora_params
+
+		pytree = split_lora_params(self)
+		return pytree
+
 	def apply_lora_to_layers(
-		self,
+		self: SELF,
 		lora_rank: int,
 		lora_pattern: tp.Optional[str] = None,
 		verbose: bool = False,
 		rngs: tp.Optional[nn.Rngs] = None,
-	):
+	) -> SELF:
 		from easydel.infra.utils import apply_lora_to_layers
 
 		self = apply_lora_to_layers(
@@ -424,11 +583,11 @@ class EasyDeLBaseModule(
 		)
 		return self
 
-	def unwrap_lora_to_layers(self, verbose: bool = False):
+	def unwrap_lora_to_layers(self: SELF, verbose: bool = False) -> SELF:
 		from easydel.infra.utils import unwrap_lora_to_layers
 
 		self = unwrap_lora_to_layers(self, verbose=verbose)
-		return unwrap_lora_to_layers
+		return self
 
 	@property
 	def transform_fn(self):
@@ -498,7 +657,7 @@ class EasyDeLBaseModule(
 			}
 		return unflatten_dict(flat_params)
 
-	def merge_params_dict(self, params_dict: tp.Dict) -> EasyDeLBaseModule:
+	def merge_params_dict(self: SELF, params_dict: tp.Dict) -> SELF:
 		"""Merges the model parameters from a dictionary into the current model.
 
 		Args:
@@ -517,6 +676,12 @@ class EasyDeLBaseModule(
 				raise KeyError(f"Parameter key {key} not found in the current model state.")
 		self = self.merge_params(unflatten_dict(current_state))
 		return self
+
+	def _flop(self, *args, **kwargs) -> tp.Optional[float]:
+		"""Calculates the FLOP (Floating Point Operations) from JaxPr"""
+		from .utils import count_flop_jaxpr
+
+		return count_flop_jaxpr(jax.make_jaxpr(self.__call__)(*args, **kwargs))
 
 	@property
 	def pure_transform_fn(self):
@@ -541,6 +706,14 @@ class EasyDeLBaseModule(
 			dtype=self.param_dtype,
 		)
 
+	@property
+	def _default_loss_config(self) -> tp.Optional[LossConfig]:
+		return None
+
+	@_default_loss_config.setter
+	def _default_loss_config(self, val):
+		return val
+
 	def compute_loss(
 		self,
 		*,
@@ -552,10 +725,19 @@ class EasyDeLBaseModule(
 		"""basic `compute_loss` call"""
 		if labels is None and self.loss_function.__name__ == ForCausalLMLoss.__name__:
 			labels = batch.get("input_ids", None)
+
+		if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
+			if loss_config is None:
+				assert hasattr(
+					self.config, "num_labels"
+				), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+				loss_config = LossConfig(num_labels=self.config.num_labels)
+				
 		assert labels is not None, "`labels` can not be `None` for computing loss."
 		loss_kwargs = loss_kwargs or {}
 		batch.pop("return_dict", None)
 		outputs = self(**batch, return_dict=True)
+
 		loss_output: LossMetrics = self.loss_function(
 			labels=labels,
 			config=loss_config,

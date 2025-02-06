@@ -43,6 +43,7 @@ PartitionLike = tp.Optional[
 ]
 _CP = tp.Type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
+SELF = tp.TypeVar("SELF")
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
@@ -71,12 +72,14 @@ def get_module_repr(module: nn.Module) -> str:
 
 	if isinstance(module, nn.Linear):
 		in_features = (
-			module.kernel.shape[0]
+			(module.kernel.shape[0] if hasattr(module.kernel, "shape") else "Null")
 			if hasattr(module, "kernel")
 			else module.kernel_init.__wrapped__.__code__.co_argcount - 1
 		)
 		out_features = (
-			module.features if hasattr(module, "features") else module.kernel.shape[1]
+			module.features
+			if hasattr(module, "features")
+			else (module.kernel.shape[-1] if hasattr(module.kernel, "shape") else "Null")
 		)
 		use_bias = module.use_bias if hasattr(module, "use_bias") else False
 		return (
@@ -581,11 +584,15 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		"""basic `compute_loss` call"""
 
 	@abstractmethod
-	def half(self):
+	def to_dtype(self: SELF, dtype) -> SELF:
+		"""Converts Model paramters to given dtype"""
+
+	@abstractmethod
+	def half(self, change_runtime_dtype: bool = True):
 		"""Converts Model paramters to float16."""
 
 	@abstractmethod
-	def float(self):
+	def float(self, change_runtime_dtype: bool = True):
 		"""Converts Model paramters to float32."""
 
 	@abstractmethod
@@ -648,11 +655,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
 	@abstractmethod
 	def quantize(
-		self,
+		self: SELF,
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 		block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-	):
+	) -> SELF:
 		"""Quantizes the model's linear layers.
 
 		Args:
@@ -685,19 +692,33 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
 	@classmethod
 	@abstractmethod
-	def lazy_init(cls, *args, **kwargs) -> BaseModuleProtocol:
+	def lazy_init(cls: tp.Type[SELF], *args, **kwargs) -> SELF:
 		"""initialize the base class with nnx.eval_shape carefully"""
 		...
 
 	@abstractmethod
 	def apply_lora_to_layers(
-		self,
+		self: SELF,
 		lora_rank: int,
 		lora_pattern: tp.Optional[str] = None,
 		verbose: bool = True,
 		rngs: tp.Optional[nn.Rngs] = None,
-	):
+	) -> SELF:
 		"""Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model."""
+		...
+
+	@abstractmethod
+	def merge_lora_params(self: SELF, pytree: tp.Dict) -> SELF:
+		"""
+		Merge Given Pytree (LoRA Params) with current LoRA Module.
+		"""
+		...
+
+	@abstractmethod
+	def split_lora_params(self: SELF) -> dict:
+		"""
+		split Given Module (LoRA Module) and return LoRA Params.
+		"""
 		...
 
 	@abstractmethod
@@ -759,6 +780,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		Returns:
 			EasyDeLBaseModule: The model with merged parameters.
 		"""
+
+	@abstractmethod
+	def _flop(self, *args, **kwargs) -> tp.Optional[float]:
+		"""Calculates the FLOP (Floating Point Operations) from JaxPr."""
+		...
 
 	def __repr__(self):
 		try:

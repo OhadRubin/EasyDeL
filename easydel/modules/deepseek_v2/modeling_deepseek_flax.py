@@ -31,6 +31,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	ModuleCaches,
 	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -581,12 +582,12 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 		)
 
 		query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-		query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-		query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+		query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+		query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
 
 		key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-		key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-		key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+		key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+		key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
 
 		query_states = query_states.transpose(0, 2, 1, 3)
 		key_states = key_states.transpose(0, 2, 1, 3)
@@ -794,7 +795,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -855,12 +856,14 @@ class DeepseekV2Model(EasyDeLBaseModule):
 					if key in self.config.rope_scaling
 				}
 				initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling["factor"]
-		return init_deepseek_rotary_embedding(
-			dim=self.config.qk_rope_head_dim,
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			base=self.config.rope_theta,
-			method=method,  # type:ignore
-			kwargs=initial_rope_kwargs,
+		return ModuleCaches(
+			init_deepseek_rotary_embedding(
+				dim=self.config.qk_rope_head_dim,
+				max_position_embeddings=self.config.granted_freq_max_position_embedding,
+				base=self.config.rope_theta,
+				method=method,  # type:ignore
+				kwargs=initial_rope_kwargs,
+			)
 		)
 
 	def __call__(
@@ -966,7 +969,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -1025,7 +1028,11 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 		if self.config.tie_word_embeddings:
 			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
 			# lm_logits = self.lm_head(hidden_states)
-			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 

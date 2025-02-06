@@ -159,7 +159,7 @@ class EasyGenerationMixin:
 
 	@cached_property
 	def _quant_class(self):
-		from easydel.utils.quantizers import EasyQuantizer
+		from easydel.layers.quantization.quantizers import EasyQuantizer
 
 		return EasyQuantizer
 
@@ -184,7 +184,7 @@ class EasyGenerationMixin:
 		"""
 		batch_size, seq_length = input_ids.shape
 		past_key_values = self.init_cache(batch_size, max_length)
-
+		sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if attention_mask is not None:
 			position_ids = attention_mask.cumsum(axis=-1) - 1
@@ -195,15 +195,14 @@ class EasyGenerationMixin:
 			)
 		else:
 			position_ids = jnp.broadcast_to(
-				jnp.arange(seq_length, dtype="i4")[None, :],
-				(batch_size, seq_length),
+				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
 			)
 
 		return self.prepare_inputs_for_call(
 			**{
 				"past_key_values": past_key_values,
-				"attention_mask": extended_attention_mask,
-				"position_ids": position_ids,
+				"attention_mask": jax.device_put(extended_attention_mask, device=sharding),
+				"position_ids": jax.device_put(position_ids, device=sharding),
 			}
 		)
 
@@ -801,15 +800,18 @@ class EasyGenerationMixin:
 			logits = logits_processor(state.sequences, logits, state.cur_len)
 
 			next_token = jnp.argmax(logits, axis=-1)
-
 			next_token = (
 				next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
 			)
-			next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
+			next_is_sent_finished = state.is_sent_finished | jnp.isin(
+				next_token,
+				eos_token_id,
+			)
 			next_token = next_token[:, None]
-
 			next_sequences = lax.dynamic_update_slice(
-				state.sequences, next_token, (0, state.cur_len)
+				state.sequences,
+				next_token,
+				(0, state.cur_len),
 			)
 			next_model_kwargs = self.update_inputs_for_generation(
 				model_outputs, state.model_kwargs

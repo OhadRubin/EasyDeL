@@ -16,19 +16,6 @@ import argparse
 import typing as tp
 from enum import Enum
 
-import jax
-import jax.extend
-from fjformer.jaxpruner import (
-	GlobalMagnitudePruning,
-	GlobalSaliencyPruning,
-	MagnitudePruning,
-	NoPruning,
-	RandomPruning,
-	SaliencyPruning,
-	SteMagnitudePruning,
-	SteRandomPruning,
-)
-
 
 class EasyDeLOptimizers(str, Enum):
 	"""
@@ -48,11 +35,9 @@ class EasyDeLSchedulers(str, Enum):
 	Each enum member represents a different learning rate schedule.
 	"""
 
+	NONE = None
 	LINEAR = "linear"
 	COSINE = "cosine"
-	NONE = "none"
-	WARM_UP_COSINE = "warm_up_cosine"
-	WARM_UP_LINEAR = "warm_up_linear"
 
 
 class EasyDeLGradientCheckPointers(str, Enum):
@@ -76,8 +61,6 @@ class EasyDeLQuantizationMethods(str, Enum):
 
 	NONE = None
 	NF4 = "nf4"
-	A8Q = "a8q"
-	A4Q = "a4q"
 	A8BIT = "8bit"
 
 
@@ -115,8 +98,6 @@ AVAILABLE_SCHEDULERS = tp.Literal[
 	"linear",
 	"cosine",
 	"none",
-	"warm_up_cosine",
-	"warm_up_linear",
 ]
 
 AVAILABLE_OPTIMIZERS = tp.Literal[
@@ -124,20 +105,6 @@ AVAILABLE_OPTIMIZERS = tp.Literal[
 	"lion",
 	"adamw",
 	"rmsprop",
-]
-
-
-AVAILABLE_PRUNING_TYPE = tp.Optional[
-	tp.Union[
-		MagnitudePruning,
-		NoPruning,
-		RandomPruning,
-		SaliencyPruning,
-		SteRandomPruning,
-		SteMagnitudePruning,
-		GlobalSaliencyPruning,
-		GlobalMagnitudePruning,
-	]
 ]
 
 
@@ -152,10 +119,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 ]
 
 
-DEFAULT_ATTENTION_MECHANISM = (
-	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
-)
-
+DEFAULT_ATTENTION_MECHANISM = "vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 
 

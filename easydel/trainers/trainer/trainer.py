@@ -15,20 +15,21 @@ import typing as tp
 from functools import partial
 
 import jax
+import jax.experimental
+import jax.lib
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
-from easydel.utils.helpers import get_logger
+from easydel.utils.helpers import capture_time, get_logger
 
 from ..base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
 )
-from ..trainer_protocol import MetricsTracker, StepMetrics
+from ..trainer_protocol import BaseProgressBar, MetricsTracker, StepMetrics
 from ._fn import evaluation_step, training_step
 from .modeling_output import TrainerOutput
 
@@ -42,24 +43,28 @@ class Trainer(BaseTrainer):
 		truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
 	) -> tp.Callable:
 		"""
-		Creates a function to collect and process batches of data for training or evaluation.
+		Creates a collate/collect function to process batches of data for training or evaluation.
 
-		This function handles padding or truncating sequences to the specified `max_sequence_length`
-		based on the chosen `truncation_mode`.
+		This function returns a callable that takes a batch (a list of dictionaries) and converts it
+		into a dictionary of JAX arrays. For models of class "ForCausalLMLoss", it also performs
+		truncation (either keeping the end or the start of the sequence) so that each sequence does not
+		exceed the specified maximum length.
 
 		Args:
 		    max_sequence_length (int): The maximum allowed sequence length.
-		    truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
-		        The truncation mode. Defaults to "keep_end".
+		    truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+		        Determines whether to keep the end or the start of the sequence when truncating.
+		        Defaults to "keep_end".
 
 		Returns:
-		    Callable: A function that takes a batch of data and returns a processed batch.
+		    tp.Callable: A function that takes a batch (list of dicts) and returns a processed dict of arrays.
 		"""
 
 		def collate_fn(batch):
 			results = {}
 			for key in batch[0].keys():
-				if self.model.loss_function.__name__ == "ForCausalLMLoss":
+				# For causal language modeling, perform truncation as needed.
+				if self.model.__class__.__name__ == "ForCausalLMLoss":
 					if truncation_mode == "keep_end":
 						corrected_sequence = [
 							jnp.array(f[key])[..., -max_sequence_length:] for f in batch
@@ -68,13 +73,11 @@ class Trainer(BaseTrainer):
 						corrected_sequence = [
 							jnp.array(f[key])[..., :max_sequence_length] for f in batch
 						]
+					results[key] = jnp.stack(corrected_sequence)
 				else:
+					# Otherwise, simply stack the arrays.
 					corrected_sequence = [jnp.array(f[key]) for f in batch]
-
-				results[key] = jnp.stack(corrected_sequence).reshape(
-					-1,
-					corrected_sequence[0].shape[-1],
-				)
+					results[key] = jnp.stack(corrected_sequence)
 			return results
 
 		return collate_fn
@@ -83,24 +86,28 @@ class Trainer(BaseTrainer):
 		"""
 		Configures and JIT-compiles the training and evaluation step functions.
 
-		This method sets up the necessary functions for training and evaluation, including:
-		    - Initialization of the model state.
-		    - Sharding of the model parameters and optimizer state.
-		    - JIT-compilation of the training and evaluation step functions.
+		This method prepares the functions that will be used during training and evaluation.
+		It sets up sharding for the model parameters and optimizer state, JIT-compiles the
+		training and evaluation functions with the appropriate static arguments and sharding
+		constraints, and also sets up the checkpoint manager.
 
 		Returns:
-		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+		    TrainerConfigureFunctionOutput: An object containing:
+		        - sharded_training_step_function: The compiled training step function.
+		        - sharded_evaluation_step_function: The compiled evaluation step function.
+		        - mesh: The device mesh used for computation.
+		        - checkpoint_manager: The checkpointer for saving/loading model state.
 		"""
-
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
+
 		sharded_training_step_function = jax.jit(
 			partial(
 				training_step,
-				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
+				partition_spec=self.arguments.step_partition_spec,
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
@@ -112,7 +119,7 @@ class Trainer(BaseTrainer):
 			],
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
-			donate_argnums=(0, 0),
+			donate_argnums=(0,),
 		)
 
 		sharded_evaluation_step_function = jax.jit(
@@ -124,7 +131,6 @@ class Trainer(BaseTrainer):
 			static_argnames=["partition_spec", "loss_config"],
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
-			donate_argnums=(0, 0),
 		)
 
 		mesh = self.model.mesh
@@ -144,31 +150,52 @@ class Trainer(BaseTrainer):
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 	):
-		"""Core training loop implementation."""
-		pbar = tqdm(
-			total=self.max_training_steps,
-			disable=jax.process_index() != 0,
-		)
-		run_exception = None
-		with self.mesh:
-			for epoch in range(self.arguments.num_train_epochs):
-				state, run_exception = self._train_epoch(
-					state=state,
-					train_dataset=self.dataloader_train,
-					metrics_tracker=metrics_tracker,
-					step_metrics=step_metrics,
-					pbar=pbar,
-					epoch=epoch,
-				)
+		"""
+		Implements the core training loop.
 
-				current_step = int(jax.device_get(state.step))
-				if current_step >= self.max_training_steps:
-					break
-				if run_exception is not None:
-					break
-		return self._prepare_training_output(
-			state=state, run_exception=run_exception
-		), run_exception
+		Iterates over the training epochs and steps, executing training steps and updating metrics.
+		A progress bar is created to track the training process. If the process index is not 0
+		(and logging on all workers is disabled), the progress bar is disabled.
+
+		Args:
+		    state (EasyDeLState): The initial model state.
+		    metrics_tracker (MetricsTracker): Tracker for accumulating and updating training metrics.
+		    step_metrics (StepMetrics): Object to calculate metrics per training step.
+
+		Returns:
+		    A tuple containing the final training output (e.g., updated state and metrics) and any run exception.
+		"""
+		disabled = False
+		if jax.process_index() != 0 and not self.arguments.log_all_workers:
+			disabled = True
+		pbar = self.create_progress_bar(
+			total=self.max_training_steps,
+			disabled=disabled,
+			desc="training process",
+		)
+		try:
+			run_exception = None
+			with self.mesh:
+				for epoch in range(self.arguments.num_train_epochs):
+					state, run_exception = self._train_epoch(
+						state=state,
+						train_dataset=self.dataloader_train,
+						metrics_tracker=metrics_tracker,
+						step_metrics=step_metrics,
+						pbar=pbar,
+						epoch=epoch,
+					)
+
+					current_step = int(jax.device_get(state.step))
+					if current_step >= self.max_training_steps:
+						break
+					if run_exception is not None:
+						break
+			return self._prepare_training_output(
+				state=state, run_exception=run_exception
+			), run_exception
+		finally:
+			pbar.close()
 
 	def _run_evaluation(
 		self,
@@ -176,21 +203,40 @@ class Trainer(BaseTrainer):
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 	):
-		"""Core evaluation loop implementation."""
-		pbar = tqdm(
+		"""
+		Implements the core evaluation loop.
+
+		Iterates over the evaluation dataset, performing evaluation steps, updating metrics, and yielding metrics
+		for each evaluation step. A progress bar is used to indicate evaluation progress.
+
+		Args:
+		    state (EasyDeLState): The model state used for evaluation.
+		    metrics_tracker (MetricsTracker): Tracker for accumulating evaluation metrics.
+		    step_metrics (StepMetrics): Object to calculate metrics per evaluation step.
+
+		Yields:
+		    dict: A dictionary containing evaluation metrics for each step.
+		"""
+		disabled = False
+		if jax.process_index() != 0 and not self.arguments.log_all_workers:
+			disabled = True
+		pbar = self.create_progress_bar(
 			total=self.max_evaluation_steps,
-			disable=jax.process_index() != 0,
+			disabled=disabled,
+			desc="evaluation process",
 		)
-		pbar.set_description("evaluation process")
-		with self.mesh:
-			for eval_metrics in self._eval_epoch(
-				state=state,
-				eval_dataset=self.dataloader_eval,
-				metrics_tracker=metrics_tracker,
-				step_metrics=step_metrics,
-				pbar=pbar,
-			):
-				yield eval_metrics
+		try:
+			with self.mesh:
+				for eval_metrics in self._eval_epoch(
+					state=state,
+					eval_dataset=self.dataloader_eval,
+					metrics_tracker=metrics_tracker,
+					step_metrics=step_metrics,
+					pbar=pbar,
+				):
+					yield eval_metrics
+		finally:
+			pbar.close()
 
 	def _train_epoch(
 		self,
@@ -198,19 +244,43 @@ class Trainer(BaseTrainer):
 		train_dataset: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		pbar: tqdm,
+		pbar: BaseProgressBar,
 		epoch: int,
 	):
-		"""Handles training for a single epoch."""
-		train_iter = iter(train_dataset) 
+		"""
+		Performs training over one epoch.
+
+		Iterates over the training dataset for a fixed number of steps in the epoch.
+		Each step fetches a batch, applies data collation, executes a training step,
+		updates metrics, logs metrics, and optionally saves checkpoints.
+
+		Args:
+		    state (EasyDeLState): The current model state.
+		    train_dataset (int): The training dataset (or an iterator over it).
+		    metrics_tracker (MetricsTracker): Tracker to update and store training metrics.
+		    step_metrics (StepMetrics): Object to calculate step-level metrics.
+		    pbar (BaseProgressBar): Progress bar instance for displaying training progress.
+		    epoch (int): The current epoch index.
+
+		Returns:
+		    A tuple of (updated state, any exception encountered during the run).
+		"""
+		train_iter = iter(train_dataset)
+		data_collator = self.data_collator
+		if data_collator is None:
+
+			def data_collator(x):
+				return x
+
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			current_step = int(jax.device_get(state.step))
-			try:  # to make training loop safer if user wants to break that.
+			try:
 				batch = self._get_next_batch(train_iter)
 				if self._should_skip_step(current_step):
 					pbar.update(1)
 					continue
 				step_metrics.start_step()
+				state = self.on_step_start(state=state, step=current_step)
 			except (
 				KeyboardInterrupt,
 				EasyDeLTimerError,
@@ -220,7 +290,14 @@ class Trainer(BaseTrainer):
 				return state, exect
 
 			# Execute training step
-			state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
+			with self.train_tracker.trace_compilation():
+				with capture_time() as execution_time:
+					state, metrics, run_exception = self._execute_train_step(
+						state=state,
+						batch=data_collator(batch),
+					)
+					metrics.execution_time = execution_time()
+					current_step = int(jax.device_get(state.step))
 			# Update and log metrics
 			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
@@ -243,14 +320,17 @@ class Trainer(BaseTrainer):
 					mean_accuracy=mean_accuracy,
 					mode="train",
 				)
-
-				self._log_metrics(
+				state, metrics = self.on_step_end(
+					state=state,
+					metrics=metrics,
+					step=current_step,
+				)
+				self.log_metrics(
 					metrics=train_metrics,
 					pbar=pbar,
 					step=current_step,
 					mode="train",
 				)
-
 				# Save checkpoint if needed
 				if self._should_save_checkpoint(current_step):
 					_ = self._save_state(
@@ -261,7 +341,6 @@ class Trainer(BaseTrainer):
 				if self._should_run_evaluation(current_step):
 					for _ in self.eval(model_state=state):
 						...
-
 			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
 				return state, run_exception
 			if run_exception is not None:
@@ -274,15 +353,39 @@ class Trainer(BaseTrainer):
 		eval_dataset: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		pbar: tqdm,
+		pbar: BaseProgressBar,
 	):
-		"""Handles training for a single epoch."""
+		"""
+		Performs evaluation over one epoch.
+
+		Iterates over the evaluation dataset, processes each batch through the evaluation step,
+		updates and logs metrics, and yields the evaluation metrics.
+
+		Args:
+		    state (EasyDeLState): The model state used for evaluation.
+		    eval_dataset (int): The evaluation dataset (or an iterator over it).
+		    metrics_tracker (MetricsTracker): Tracker for accumulating evaluation metrics.
+		    step_metrics (StepMetrics): Object to calculate step-level metrics.
+		    pbar (BaseProgressBar): Progress bar instance for displaying evaluation progress.
+
+		Yields:
+		    dict: A dictionary of evaluation metrics for each evaluation step.
+		"""
 		eval_iter = iter(eval_dataset)
-		for current_step in range(self.max_evaluation_steps):
+		data_collator = self.data_collator
+		if data_collator is None:
+
+			def data_collator(x):
+				return x
+
+		for current_step in range(1, self.max_evaluation_steps + 1):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
-				metrics = self._execute_eval_step(state, batch)
+				with self.evalu_tracker.trace_compilation():
+					with capture_time() as execution_time:
+						metrics = self._execute_eval_step(state, data_collator(batch))
+						metrics.execution_time = execution_time()
 				mean_loss, mean_accuracy = metrics_tracker.update(
 					metrics.loss,
 					metrics.accuracy,
@@ -300,26 +403,52 @@ class Trainer(BaseTrainer):
 					mean_accuracy=mean_accuracy,
 					mode="eval",
 				)
-				self._log_metrics(
+				self.log_metrics(
 					metrics=eval_metrics,
 					pbar=pbar,
 					step=current_step,
 					mode="eval",
 				)
-
 				yield eval_metrics
-			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as _:
+			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
 				break
 
 	def _execute_eval_step(self, state, batch) -> LossMetrics:
-		"""Execute a single eval step."""
+		"""
+		Executes a single evaluation step.
+
+		Args:
+		    state: The current model state.
+		    batch: A processed batch of evaluation data.
+
+		Returns:
+		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
+		"""
 		metrics = self.sharded_evaluation_step_function(state, batch)
 		return metrics
 
 	def _execute_train_step(
-		self, state, batch
+		self,
+		state,
+		batch,
 	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
-		"""Execute a single training step."""
+		"""
+		Executes a single training step.
+
+		This function optionally updates the model's pruning module before and after the gradient step.
+		It then calls the sharded training step function to compute the gradients and update the state.
+		If an exception occurs (e.g. KeyboardInterrupt, timer error, or break request), it is captured and returned.
+
+		Args:
+		    state: The current model state.
+		    batch: A processed batch of training data.
+
+		Returns:
+		    A tuple containing:
+		        - The updated model state.
+		        - The computed LossMetrics.
+		        - An exception instance if one was raised during execution; otherwise, None.
+		"""
 		if self.pruning_module is not None:
 			state = state.replace(
 				graphstate=self.pruning_module.pre_forward_update(
@@ -327,11 +456,12 @@ class Trainer(BaseTrainer):
 					state.opt_state,
 				)
 			)
-
-		# Forward and backward pass
+		metrics = LossMetrics()
 		try:
-			state, metrics = self.sharded_training_step_function(state, batch)
-			# Apply post-gradient updates
+			state, metrics = jax.block_until_ready(
+				self.sharded_training_step_function(state, batch)
+			)
+			# Apply post-gradient updates via the pruning module, if present.
 			if self.pruning_module is not None:
 				state = state.replace(
 					graphstate=self.pruning_module.post_gradient_update(
@@ -339,32 +469,52 @@ class Trainer(BaseTrainer):
 						state.opt_state,
 					)
 				)
-
 			return state, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
 			return state, metrics, run_exception
 
 	def _finalize_training(self, output, run_exception):
-		"""Finalize training and prepare output."""
+		"""
+		Finalizes the training process and prepares the output.
 
-		if self.arguments.do_eval:
-			for _ in self.eval(output.state):
-				...
+		If evaluation is enabled, this method runs an additional evaluation pass before finishing.
+		It then calls the finish method to perform any cleanup and returns the final output.
 
+		Args:
+		    output: The output object containing the final state and metrics.
+		    run_exception: Any exception that was encountered during training.
+
+		Returns:
+		    The final output object.
+		"""
+		try:
+			if self.arguments.do_eval:
+				for _ in self.eval(output.state):
+					...
+		except RuntimeError:
+			logger.info(
+				"Caught RuntimeError from eval function "
+				"(mostly due to `StopIteration` being called manually)"
+			)
 		self.finish()
-
 		return output
 
 	def train(self) -> TrainerOutput:
-		self.start_training_hook()
+		"""
+		Executes the complete training process.
 
+		This method sets up initial metrics and logging, runs the training loop, and finalizes training.
+		It calls the training hook at the beginning and returns a TrainerOutput object at the end.
+
+		Returns:
+		    TrainerOutput: An object containing the final training state, metrics, and any additional outputs.
+		"""
+		self.start_training_hook()
 		state = self.model_state
 		metrics_tracker = MetricsTracker()
 		step_metrics = StepMetrics(self.arguments)
-
-		# Setup initial metrics and logging
+		# Setup initial metrics and logging.
 		self._setup_initial_metrics(state)
-
 		output, run_exception = self._run_training_loop(
 			state=self.model_state,
 			metrics_tracker=metrics_tracker,
@@ -374,32 +524,31 @@ class Trainer(BaseTrainer):
 
 	def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
 		"""
-		Evaluates Model using the provided model state.
+		Evaluates the model using the provided model state.
 
-		This method iterates over the evaluation dataset, performs forward passes,
-		calculates evaluation metrics, logs the metrics, and yields the metrics for
-		each evaluation step.
+		This method iterates over the evaluation dataset, performs forward passes, calculates evaluation metrics,
+		logs the metrics, and yields the metrics for each evaluation step.
 
 		Args:
-		    model_state (EasyDeLState): The EasyDeLState object containing the model parameters
-		                                and other relevant information.
+		    model_state (EasyDeLState): The state of the model (including parameters and configuration)
+		                                to be used for evaluation.
 
 		Yields:
-		    Iterator[dict]: An iterator yielding a dictionary of evaluation metrics for each step.
+		    Iterator[dict]: An iterator yielding a dictionary of evaluation metrics for each evaluation step.
 
 		Raises:
-		    AssertionError: If `self.dataloader_eval` is not set (meaning the evaluation dataloader is missing).
+		    AssertionError: If the evaluation dataloader is not set.
 		"""
 		self.start_evaluation_hook()
 		try:
 			metrics_tracker = MetricsTracker()
 			step_metrics = StepMetrics(self.arguments)
-
 			for metrics in self._run_evaluation(
 				state=model_state,
 				metrics_tracker=metrics_tracker,
 				step_metrics=step_metrics,
 			):
 				yield metrics
-		except RuntimeError:  # sometimes we get a RuntimeError in multi-host evaluation, we should catch it and continue.
+		except RuntimeError:
+			# In multi-host evaluation, RuntimeError might be raised; catch and continue.
 			...

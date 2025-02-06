@@ -15,6 +15,8 @@
 """Utility functions for managing and manipulating nnx module states."""
 
 import typing as tp
+from collections.abc import Iterable
+from copy import deepcopy
 
 import chex
 import jax
@@ -95,8 +97,9 @@ def string_key_to_int(xs):
 	return xs
 
 
-def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
-	assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
+def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap=False):
+	if not fumap:
+		assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
 
 	def _key(path):
 		if sep is None:
@@ -121,6 +124,10 @@ def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
 	return _flatten(xs, ())
 
 
+def is_iterable(obj):
+	return isinstance(obj, Iterable)
+
+
 def _dict_unflatten_dict(xs, sep=None):
 	assert isinstance(xs, dict), f"input is not a dict; it is a {type(xs)}"
 	result = {}
@@ -143,6 +150,7 @@ def flatten_dict(
 	keep_empty_nodes: bool = False,
 	is_leaf: tp.Optional[tp.Callable[[tuple, tp.Any], bool]] = None,
 	sep: tp.Optional[str] = None,
+	fumap: bool = False,
 ) -> tp.Dict[tp.Union[tuple, str], tp.Any]:
 	"""
 	Enhanced dictionary flattening with better type handling and validation.
@@ -160,7 +168,7 @@ def flatten_dict(
 	    TypeError: If input is not a dictionary or mapping
 	"""
 
-	if isinstance(xs, dict):
+	if isinstance(xs, dict) or fumap:
 		if sep is not None:
 			xs = int_key_to_string(xs)
 		return _dict_flatten_dict(
@@ -168,6 +176,7 @@ def flatten_dict(
 			keep_empty_nodes=keep_empty_nodes,
 			is_leaf=is_leaf,
 			sep=sep,
+			fumap=fumap,
 		)
 	return traversals.flatten_mapping(
 		xs,
@@ -511,12 +520,13 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		if tree_values is not None:
 			params[keys].value = tree_values
 		else:
-			if keys[-1] == "kernel":
+			if keys[-1] != "bias":
 				_path = ".".join([str(k) for k in keys])
 				logger.info(f"a parameter's missing at {_path}, please double check.")
 
 			# Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
 			params[keys].value = None
+
 	others = recreate_meta_values(others)
 	state = refine_graphs(others, params)
 	return state
@@ -661,3 +671,24 @@ def named_tree_map(
 		*rest,
 		is_leaf=is_leaf,
 	)
+
+
+def deepcopy_model(model):
+	"""
+	Creates a deep copy of a JAX model.
+
+	This function takes a JAX model, extracts its leaves (the individual
+	components of the model), deep copies them, and then reconstructs the
+	model with the copied leaves.
+
+	Args:
+		model: A JAX model to be deep copied. This can be any nested structure
+				 of JAX arrays, lists, tuples, dicts, etc.
+
+	Returns:
+		A deep copy of the input model with the same structure but with all
+		leaves deep copied.
+	"""
+	leaves = deepcopy(jax.tree_util.tree_leaves(model))
+	struct = jax.tree_util.tree_structure(model)
+	return jax.tree_util.tree_unflatten(struct, leaves)

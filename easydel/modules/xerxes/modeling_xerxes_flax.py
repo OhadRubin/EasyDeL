@@ -54,7 +54,7 @@ class RMSNorm(nn.Module):
 		self.eps = eps
 		self.dtype = dtype
 		self.param_dtype = param_dtype
-		self.weight = nn.Param(jnp.ones(self.dim, dtype=param_dtype))
+		self.kernel = nn.Param(jnp.ones(self.dim, dtype=param_dtype))
 
 	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
 		return x / lax.sqrt(
@@ -62,9 +62,18 @@ class RMSNorm(nn.Module):
 		)
 
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-		x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
+		if self.dtype in [
+			jnp.float8_e4m3b11fnuz,
+			jnp.float8_e4m3fn,
+			jnp.float8_e4m3fnuz,
+			jnp.float8_e5m2,
+			jnp.float8_e5m2fnuz,
+		]:
+			x = x.astype(jnp.float32)
+		else:
+			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
-		return (self.weight.value.astype(self.dtype)) * output
+		return (self.kernel.value.astype(self.dtype)) * output
 
 
 class XerxesAttention(FlaxAttentionModule):
@@ -730,7 +739,11 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 		if self.config.tie_word_embeddings:
 			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
 			# lm_logits = self.lm_head(hidden_states)
-			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 

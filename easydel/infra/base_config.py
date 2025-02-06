@@ -16,16 +16,15 @@ import typing as tp
 import warnings
 from dataclasses import dataclass
 
+import chex
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.experimental.mesh_utils import create_device_mesh
-from jax.sharding import Mesh
 from transformers.configuration_utils import PretrainedConfig
 
-from easydel.escale import PartitionAxis
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
@@ -38,6 +37,13 @@ from .etils import (
 	EasyDeLQuantizationMethods,
 )
 
+if tp.TYPE_CHECKING:
+	from easydel.layers.rotary_embedding import RopeConfig
+
+	from .utils import ModuleCaches
+else:
+	RopeConfig = tp.Any
+	ModuleCaches = tp.Any
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
@@ -128,6 +134,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 	kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]]
 	flash_attention_backward_pass_impl: tp.Literal["triton", "xla"]
 	attn_dtype: jnp.dtype
+	attn_softmax_dtype: jnp.dtype
 	fcm_max_ratio: float
 	fcm_min_ratio: float
 	hardware_abstraction: bool
@@ -169,7 +176,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		quantization_blocksize (int): Block size for quantization. Default is 64.
 		kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]]): Name of the key-value cache sharding sequence axis. Default is "sp".
 		flash_attention_backward_pass_impl (tp.Literal["triton", "xla"]): Implementation for flash attention backward pass. Default is "triton".
-		attn_dtype (jnp.dtype): Data type for attention. Default is jnp.float32.
+		attn_dtype (jnp.dtype): Data type for attention. Default is device half.
+		attn_softmax_dtype (jnp.dtype): Data type for softmax ops in attention. Default is jnp.float32.
 		fcm_max_ratio (float): Maximum ratio for FCM. Default is 0.0.
 		fcm_min_ratio (float): Minimum ratio for FCM. Default is 0.0.
 		hardware_abstraction (bool): Whether to use hardware abstraction. Default is DEFAULT_HARDWARE_ABSTRACTION.
@@ -213,6 +221,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = "sp",
 		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
 		attn_dtype: jnp.dtype = jnp.float32,
+		attn_softmax_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
 		hardware_abstraction: bool = DEFAULT_HARDWARE_ABSTRACTION,
@@ -260,7 +269,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		self.quantization_blocksize = getattr(self, "quantization_blocksize", quantization_blocksize)
 		self.quantization_pattern = getattr(self, "quantization_pattern", quantization_pattern)
 		self.flash_attention_backward_pass_impl = getattr(self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl)
-		self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
+		self.attn_dtype = getattr(self, "attn_dtype",  attn_dtype)
+		self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
 		self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
 		self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
 		self.hardware_abstraction = getattr(self, "hardware_abstraction", hardware_abstraction)
@@ -286,7 +296,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	def create_mesh(
 		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		backend="",
+		backend: tp.Optional[str] = None,
 	):
 		"""The create_mesh function creates a mesh object that can be used to shard arrays.
 
@@ -298,28 +308,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    A mesh object
 		"""
-		array_devices = jax.numpy.ones(
-			(len(jax.devices() if backend == "" else jax.devices(backend)), 1)
-		)
-		if isinstance(axis_dims, str):
-			axis_dims = eval(axis_dims)
-			warnings.warn(
-				"axis_dims argument is not a tp.Sequence of int and it's an string. "
-				"(backbone Warning in EasyDeLModuleConfig)\n"
-				f"\tchanged to {axis_dims}",
-				stacklevel=1,
-			)
-		if isinstance(axis_names, str):
-			axis_names = eval(axis_names)
-			warnings.warn(
-				"axis_names argument is not a tp.Sequence of strings and it's an string class. "
-				"(backbone Warning in EasyDeLModuleConfig)\n"
-				f"\tchanged to {axis_names}",
-				stacklevel=1,
-			)
-		resh = array_devices.reshape(axis_dims).shape
+		from eformer.escale import create_mesh
 
-		return Mesh(create_device_mesh(resh), axis_names)
+		if backend == "":
+			backend = None
+		return create_mesh(
+			axis_dims=axis_dims,
+			axis_names=axis_names,
+			backend=backend,
+		)
 
 	@property
 	def mesh(self):
@@ -431,6 +428,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = ...,
 		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
+		attn_softmax_dtype: jnp.dtype = ...,
 		hardware_abstraction: bool = ...,
 		pallas_m_block_size: int = ...,
 		pallas_k_block_size: int = ...,
@@ -440,7 +438,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-		                    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+				axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
 		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
@@ -467,7 +465,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 				quantization_pattern (str): re pattern to be used for quantizing layers.
 				kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
 		    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
-		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
+		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to device half.
+				attn_softmax_dtype (jnp.dtype, optional): Data type for softmax in attention op computations. Defaults to jnp.float32.
 		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
 		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
 		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
@@ -504,7 +503,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "quantization_blocksize", EasyDeLQuantizationMethods.NONE, quantization_blocksize)
 		set_attrs_smartly(self, "quantization_pattern", ".*", quantization_pattern)
 		set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
-		set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
+		set_attrs_smartly(self, "attn_dtype",  jnp.float32, attn_dtype)
+		set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype) 
 		set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
 		set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
 		set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
@@ -537,6 +537,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
 				except TypeError:
 					pass
 		return string + ")"
+
+	def to_dict(self) -> tp.Dict[str, tp.Any]:
+		sd = self.__dict__
+		forbidden_types = ["_ScalarMeta"]
+		extracted_values = {
+			k: sd.pop(k)
+			for k in list(sd.keys())
+			if sd.get(k).__class__.__name__ in forbidden_types
+		}
+		result = super().to_dict()
+		for k, v in extracted_values.items():
+			sd[k] = v
+		return result
 
 	def add_jax_args(self, **kwargs):
 		for k, v in kwargs.items():
@@ -673,55 +686,49 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			self.max_position_embeddings,
 		)
 
-	def get_basic_rope(
-		self,
-		dtype,
-		head_size,
-		rotary_dim=None,
-		is_neox_style=True,
-		base=None,
-	):
-		from easydel.layers.rotary_embedding import get_rope
+	def _get_rope_config(self) -> RopeConfig:
+		"""Get RoPE configuration from the instance attributes."""
+		from easydel.layers.rotary_embedding import RopeConfig
 
-		if rotary_dim is None:
-			rotary_dim = head_size
+		if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+			config = RopeConfig()
+		else:
+			config = RopeConfig.from_dict(self.rope_scaling)
 
-		class rope_scaling(dict):
-			__hash__ = hash_fn
-
-		initial_rope_kwargs = rope_scaling(rope_type="default")
-		if getattr(self, "rope_scaling", None) is not None:
-			scaling_type = self.rope_scaling.get("rope_type", None)
-			scaling_type = self.rope_scaling.get("type", scaling_type)
-			scaling_factor = self.rope_scaling.get("factor", None)
-			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
-			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
-			original_max_position_embeddings = self.rope_scaling.get(
-				"original_max_position_embeddings",
-				None,
-			)
-			if original_max_position_embeddings is None:
-				original_max_position_embeddings = getattr(
+			if config.original_max_position_embeddings is None:
+				config.original_max_position_embeddings = getattr(
 					self,
 					"original_max_position_embeddings",
 					None,
 				)
-			long_factor = self.rope_scaling.get("long_factor", None)
-			short_factor = self.rope_scaling.get("short_factor", None)
-			long_mscale = self.rope_scaling.get("long_mscale", None)
-			short_mscale = self.rope_scaling.get("short_mscale", None)
-			initial_rope_kwargs = rope_scaling(
-				rope_type=scaling_type,
-				factor=scaling_factor,
-				low_freq_factor=low_freq_factor,
-				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position_embeddings,
-				long_factor=long_factor,
-				short_factor=short_factor,
-				long_mscale=long_mscale,
-				short_mscale=short_mscale,
-			)
 
+		return config
+
+	def get_basic_rope(
+		self,
+		dtype: chex.Array,
+		head_size: int,
+		rotary_dim: tp.Optional[int] = None,
+		is_neox_style: bool = True,
+		base: tp.Optional[float] = None,
+	):
+		"""
+		Get basic rotary position embeddings.
+
+		Args:
+		    dtype: Data type for the embeddings
+		    head_size: Size of attention heads
+		    rotary_dim: Dimension for rotary embeddings (defaults to head_size)
+		    is_neox_style: Whether to use NeoX style embeddings
+		    base: Base value for frequency computation (defaults to self.rope_theta)
+
+		Returns:
+		    Rotary position embeddings func
+		"""
+		from easydel.layers.rotary_embedding import get_rope
+
+		rotary_dim = rotary_dim or head_size
+		rope_config = self._get_rope_config()
 		return get_rope(
 			head_size=head_size,
 			rotary_dim=rotary_dim,
@@ -729,74 +736,55 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			base=base or self.rope_theta,
 			dtype=dtype,
 			is_neox_style=is_neox_style,
-			rope_scaling=initial_rope_kwargs,
+			rope_scaling=rope_config.to_dict(),
 		)
 
 	def get_basic_frequencies(
 		self,
-		head_size=None,
-		rotary_dim=None,
-		base=None,
-	):
+		head_size: tp.Optional[int] = None,
+		rotary_dim: tp.Optional[int] = None,
+		base: tp.Optional[float] = None,
+	) -> ModuleCaches:
+		"""
+		Get basic frequencies for rotary embeddings.
+
+		Args:
+		    head_size: Size of attention heads (defaults to self.head_dim)
+		    rotary_dim: Dimension for rotary embeddings (defaults to head_size)
+		    base: Base value for frequency computation (defaults to self.rope_theta)
+
+		Returns:
+		    ModuleCaches instance containing computed frequencies
+		"""
 		from easydel.layers.rotary_embedding import get_frequencies
 
-		if head_size is None:
-			head_size = self.head_dim  # last point
-		if rotary_dim is None:
-			rotary_dim = head_size
+		from .utils import ModuleCaches
 
-		class rope_scaling(dict):
-			__hash__ = hash_fn
+		head_size = head_size or self.head_dim
+		rotary_dim = rotary_dim or head_size
+		rope_config = self._get_rope_config()
 
-		initial_rope_kwargs = rope_scaling(rope_type="default")
-
-		if getattr(self, "rope_scaling", None) is not None:
-			scaling_type = self.rope_scaling.get("rope_type", None)
-			scaling_type = self.rope_scaling.get("type", scaling_type)
-			scaling_factor = self.rope_scaling.get("factor", None)
-			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
-			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
-			original_max_position_embeddings = self.rope_scaling.get(
-				"original_max_position_embeddings",
-				None,
-			)
-			if original_max_position_embeddings is None:
-				original_max_position_embeddings = getattr(
-					self,
-					"original_max_position_embeddings",
-					None,
-				)
-			long_factor = self.rope_scaling.get("long_factor", None)
-			short_factor = self.rope_scaling.get("short_factor", None)
-			long_mscale = self.rope_scaling.get("long_mscale", None)
-			short_mscale = self.rope_scaling.get("short_mscale", None)
-			initial_rope_kwargs = rope_scaling(
-				rope_type=scaling_type,
-				factor=scaling_factor,
-				low_freq_factor=low_freq_factor,
-				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position_embeddings,
-				long_factor=long_factor,
-				short_factor=short_factor,
-				long_mscale=long_mscale,
-				short_mscale=short_mscale,
-			)
-
-		return get_frequencies(
+		frequencies = get_frequencies(
 			head_size=head_size,
 			rotary_dim=rotary_dim,
 			max_position=self.granted_freq_max_position_embedding,
 			base=base or self.rope_theta,
-			rope_scaling=initial_rope_kwargs,
+			rope_scaling=rope_config.to_dict(),
 		)
 
+		return ModuleCaches(frequencies)
+
 	def get_basic_causal_mask(self, dtype="bool"):
-		return nn.make_causal_mask(
-			jnp.ones(
-				shape=(1, self.granted_mask_max_position_embedding),
+		from .utils import ModuleCaches
+
+		return ModuleCaches(
+			nn.make_causal_mask(
+				jnp.ones(
+					shape=(1, self.granted_mask_max_position_embedding),
+					dtype=dtype,
+				),
 				dtype=dtype,
-			),
-			dtype=dtype,
+			)
 		)
 
 	def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):

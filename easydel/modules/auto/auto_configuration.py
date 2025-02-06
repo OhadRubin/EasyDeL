@@ -15,13 +15,13 @@ import functools
 import typing as tp
 
 import flax.nnx
-from jax.sharding import PartitionSpec
-
-from easydel.escale import (
+from eformer.escale import (
 	PartitionAxis,
 	make_shard_and_gather_fns,
 	match_partition_rules,
 )
+from jax.sharding import PartitionSpec
+
 from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
@@ -62,7 +62,6 @@ def get_modules_by_type(
 			torch_dict_to_easydel_params,
 			embedding_layer_names=registred_module.embedding_layer_names,
 			layernorm_names=registred_module.layernorm_names,
-			rnn_based_or_rwkv=registred_module.rnn_based_or_rwkv,
 		),
 	)
 

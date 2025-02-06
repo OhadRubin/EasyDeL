@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import typing as tp
-import warnings
 from collections import defaultdict
 from functools import partial
 
@@ -28,24 +27,32 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import ProcessingClassType
-from easydel.trainers.trainer.trainer import Trainer
 from easydel.utils.helpers import get_logger
+from easydel.utils.traversals import deepcopy_model
 
-from ..base_trainer import (
-	BaseTrainer,
-	TrainerConfigureDataloaderOutput,
-	TrainerConfigureFunctionOutput,
-	TrainerConfigureModelOutput,
-)
+from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
+from ..trainer.trainer import Trainer
+from ..utils import DataCollatorForPreference
+from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
-from .func_utils import concatenated_forward, evaluation_step, training_step
-from .utils import DPODataCollatorWithPadding, build_tokenize
+from ..training_configurations import MetricsType
 
 if tp.TYPE_CHECKING:
-	from datasets import Dataset
+	from datasets import Dataset, IterableDataset
+	from transformers import (
+		BaseImageProcessor,
+		FeatureExtractionMixin,
+		PreTrainedTokenizerBase,
+		ProcessorMixin,
+	)
 else:
 	Dataset = tp.Any
+	IterableDataset = tp.Any
+	BaseImageProcessor = tp.Any
+	FeatureExtractionMixin = tp.Any
+	PreTrainedTokenizerBase = tp.Any
+	ProcessorMixin = tp.Any
 
 logger = get_logger(__name__)
 
@@ -70,219 +77,289 @@ class DPOTrainer(Trainer):
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
-		dataset_map_arguments: tp.Optional[dict] = None,
-		low_mem_usage: bool = True,
-		auto_fix_data: bool = True,
 	):
 		assert arguments is not None, (
 			"You Have to pass arguments that will be used for training but you have passed"
 			"`arguments=None`"
 		)
-		assert isinstance(
-			arguments, DPOConfig
-		), f"arguments type must be `DPOConfig` but got {type(arguments)}"
+		assert isinstance(arguments, DPOConfig), (
+			f"arguments type must be `DPOConfig` but got {type(arguments)}"
+		)
 
-		assert (
-			processing_class is not None
-		), "processing_class must be specified to tokenize a DPO dataset."
+		assert processing_class is not None, (
+			"processing_class must be specified to tokenize a DPO dataset."
+		)
 		self.arguments = arguments
-		self.auto_fix_data = auto_fix_data
 		self.truncation_mode = arguments.truncation_mode
 		self.processing_class = processing_class
-		self.is_encoder_decoder = False
+		self.is_encoder_decoder = arguments.is_encoder_decoder
 		self._precomputed_train_ref_log_probs = False
 		self._precomputed_eval_ref_log_probs = False
-		self.low_mem_usage = low_mem_usage
 
-		arguments.padding_value = (
-			arguments.padding_value
-			if arguments.padding_value is not None
-			else processing_class.pad_token_id
-		)
-		data_collator = (
-			DPODataCollatorWithPadding(
+		if arguments.padding_value is not None:
+			self.padding_value = arguments.padding_value
+		else:
+			if (
+				hasattr(processing_class, "pad_token_id")
+				and processing_class.pad_token_id is not None
+			):
+				self.padding_value = processing_class.pad_token_id
+			elif (
+				hasattr(processing_class, "tokenizer")
+				and processing_class.tokenizer.pad_token_id is not None
+			):
+				self.padding_value = processing_class.tokenizer.pad_token_id
+			else:
+				raise ValueError(
+					"`padding_value` is not specified in `DPOConfig`, and `pad_token_id` is missing in the "
+					"`processing_class`. Please either set the `padding_value` argument in `DPOConfig`, or set "
+					"`tokenizer.pad_token` (e.g., `tokenizer.pad_token = tokenizer.eos_token`) before instantiating "
+					"the trainer."
+				)
+		arguments.padding_value = self.padding_value
+		input_data_collator = (
+			DataCollatorForPreference(
 				max_prompt_length=arguments.max_prompt_length,
 				max_completion_length=arguments.max_completion_length,  # type: ignore
-				pad_token_id=processing_class.pad_token_id,  # type: ignore
+				pad_token_id=self.padding_value,  # type: ignore
 				label_pad_token_id=arguments.label_pad_token_id,
 				is_encoder_decoder=arguments.is_encoder_decoder,
 			)
 			if data_collator is None
 			else data_collator
 		)
-		self._stored_metrics = defaultdict(lambda: defaultdict(list))
+		self.input_data_collator = input_data_collator
 
-		if dataset_map_arguments is None:
-			dataset_map_arguments = {}
+		self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
 		processing_class = processing_class
 
-		if train_dataset[-1].get("chosen", None) is None:
-			warnings.warn(
-				"couldn't find `chosen` column in dataset"
-				", this might make DPOTrainer break down if you haven't customize trainer.",
-				stacklevel=2,
-			)
-		if train_dataset[-1].get("rejected", None) is None:
-			warnings.warn(
-				"couldn't find `rejected` column in dataset"
-				", this might make DPOTrainer break down if you haven't customize trainer.",
-				stacklevel=2,
-			)
-		if train_dataset[-1].get("prompt", None) is None:
-			warnings.warn(
-				"couldn't find `prompt` column in dataset"
-				", this might make DPOTrainer break down if you haven't customize trainer.",
-				stacklevel=2,
-			)
-		train_dataset = train_dataset.map(
-			maybe_extract_prompt,
-			num_proc=arguments.dataset_num_proc,
-			desc="Extracting Prompts",
-		)
-		train_dataset = train_dataset.map(
-			maybe_apply_chat_template,
-			fn_kwargs={"processing_class": processing_class},
-			num_proc=arguments.dataset_num_proc,
-			desc="Apply Chat Template",
-		)
-		if eval_dataset is not None:
-			eval_dataset = eval_dataset.map(
-				maybe_extract_prompt,
-				num_proc=arguments.dataset_num_proc,
-				desc="Eval - Extracting Prompts",
-			)
-			eval_dataset = eval_dataset.map(
-				maybe_apply_chat_template,
-				fn_kwargs={"processing_class": processing_class},
-				num_proc=arguments.dataset_num_proc,
-				desc="Eval - Apply Chat Template",
-			)
-		fn_kwargs = {
-			"processing_class": self.processing_class,
-			"processor": None,
-		}
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
-
+		if reference_model is None:
+			reference_model = deepcopy_model(model)
 		if not isinstance(reference_model, EasyDeLState):
 			reference_model = reference_model.to_state()
 
-		_tokenize = build_tokenize(
-			model=model.model if arguments.is_encoder_decoder else None,
-			args=arguments,
-		)
-
-		train_dataset = train_dataset.map(
-			_tokenize,
-			fn_kwargs=fn_kwargs,
-			batched=True,
-			num_proc=arguments.dataset_num_proc,
-			writer_batch_size=10,
-			desc="Tokenizing train dataset",
+		train_dataset = self._prepare_dataset(
+			train_dataset,
+			processing_class,
+			arguments,
+			"train",
 		)
 		if eval_dataset is not None:
-			eval_dataset = eval_dataset.map(
-				_tokenize,
-				fn_kwargs=fn_kwargs,
-				batched=True,
-				num_proc=arguments.dataset_num_proc,
-				writer_batch_size=10,
-				desc="Tokenizing eval dataset",
-			)
+			if isinstance(eval_dataset, dict):
+				eval_dataset = {
+					key: self._prepare_dataset(dataset, processing_class, arguments, key)
+					for key, dataset in eval_dataset.items()
+				}
+			else:
+				eval_dataset = self._prepare_dataset(
+					eval_dataset,
+					processing_class,
+					arguments,
+					"eval",
+				)
 
 		self.arguments = arguments
 
-		self.is_in_train = False
-		self.data_collator = data_collator
 		self.train_dataset = train_dataset
 		self.eval_dataset = eval_dataset
 		self.processing_class = processing_class
 		self.reference_state = reference_model
-		self._loggers_initialized = False
-		self.mesh = model.model.mesh
 
-		self._cached_p_l_s = None
-		self._cached_c_l_s = None
-		self._cached_r_l_s = None
 		super().__init__(
 			model_state=model,
 			arguments=arguments,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
+			data_collator=None,
 		)
 
-	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
-		"""
-		Configures the dataloaders for training and evaluation.
+	def _prepare_dataset(
+		self,
+		dataset: tp.Union[Dataset, IterableDataset],
+		processing_class: tp.Union[
+			PreTrainedTokenizerBase,
+			BaseImageProcessor,
+			FeatureExtractionMixin,
+			ProcessorMixin,
+		],
+		arguments: DPOConfig,
+		dataset_name: str,
+	) -> tp.Union[Dataset, IterableDataset]:
+		map_kwargs = {"writer_batch_size": 10}
+		from datasets import Dataset
 
-		This method creates the training and evaluation dataloaders using the provided
-		datasets and data collator. It also determines the maximum number of training
-		and evaluation steps based on the dataset sizes and training arguments.
+		if isinstance(dataset, Dataset):
+			map_kwargs["num_proc"] = arguments.dataset_num_proc
+
+		if isinstance(dataset, Dataset):
+			map_kwargs["desc"] = f"Extracting prompt in {dataset_name} dataset"
+		dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
+
+		if isinstance(dataset, Dataset):
+			map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+		dataset = dataset.map(
+			maybe_apply_chat_template,
+			fn_kwargs={
+				"tokenizer": processing_class,
+				"tools": arguments.tools,
+			},
+			**map_kwargs,
+		)
+
+		if isinstance(dataset, Dataset):
+			map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+
+		dataset = dataset.map(
+			self.tokenize_row,  # if not self.is_vision_model else self.process_row,
+			remove_columns=["prompt", "chosen", "rejected"],
+			fn_kwargs={
+				"processing_class": processing_class,
+				"max_prompt_length": arguments.max_prompt_length,
+				"max_completion_length": arguments.max_completion_length,
+				"add_special_tokens": False,
+			},
+			**map_kwargs,
+		)
+		return dataset
+
+	@staticmethod
+	def tokenize_row(
+		features,
+		processing_class,
+		max_prompt_length,
+		max_completion_length,
+		add_special_tokens,
+	):
+		"""
+		Tokenize a row of the dataset.
+
+		Args:
+		    features (`dict[str, str]`):
+		        Row of the dataset, should contain the keys `"prompt"`, `"chosen"`, and `"rejected"`.
+		    processing_class (`PreTrainedTokenizerBase`):
+		        Processing class used to process the data.
+		    max_prompt_length (`int` or `None`):
+		        Maximum length of the prompt sequence. If `None`, the prompt sequence is not truncated.
+		    max_completion_length (`int` or `None`):
+		        Maximum length of the completion sequences. If `None`, the completion sequences are not truncated.
+		    add_special_tokens (`bool`):
+		        Whether to add special tokens to the sequences. Typically used for encoder-decoder models. If `True`,
+		        the prompt sequence will have a bos token prepended and an eos token appended. In any case, the
+		        completion sequences will have an eos token appended.
 
 		Returns:
-				TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-																				maximum number of training and evaluation steps.
+		    `dict[str, list[int]]`:
+		        Tokenized sequences with the keys `"prompt_input_ids"`, `"chosen_input_ids"`, and
+		        `"rejected_input_ids".
 		"""
-		dataloader_train = self.get_train_dataloader()
-		max_evaluation_steps = None
-		dataloader_eval = None
+		tokenizer = processing_class
+		prompt_input_ids = tokenizer(
+			features["prompt"],
+			add_special_tokens=False,
+		)["input_ids"]
+		chosen_input_ids = tokenizer(
+			features["chosen"],
+			add_special_tokens=False,
+		)["input_ids"]
+		rejected_input_ids = tokenizer(
+			features["rejected"],
+			add_special_tokens=False,
+		)["input_ids"]
 
-		max_training_steps = (
-			self.arguments.num_train_epochs * len(dataloader_train)
-			if self.arguments.max_training_steps is None
-			else self.arguments.max_training_steps
+		if add_special_tokens:
+			if tokenizer.bos_token_id is not None:
+				prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
+			if tokenizer.eos_token_id is not None:
+				prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+		chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
+		rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
+
+		if max_prompt_length is not None:
+			prompt_input_ids = prompt_input_ids[-max_prompt_length:]
+		if max_completion_length is not None:
+			chosen_input_ids = chosen_input_ids[:max_completion_length]
+			rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+		return {
+			"prompt_input_ids": prompt_input_ids,
+			"chosen_input_ids": chosen_input_ids,
+			"rejected_input_ids": rejected_input_ids,
+		}
+
+	@staticmethod
+	def process_row(
+		features,
+		processing_class,
+		max_prompt_length,
+		max_completion_length,
+		add_special_tokens,
+	):
+		processor, tokenizer = (processing_class, processing_class.tokenizer)
+		processed_features = processor(
+			images=features["images"],
+			text=features["prompt"],
+			add_special_tokens=False,
 		)
-		if self.eval_dataset is not None:
-			dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
-			max_evaluation_steps = len(dataloader_eval)
-		return TrainerConfigureDataloaderOutput(
-			dataloader_eval=dataloader_eval,
-			dataloader_train=dataloader_train,
-			max_evaluation_steps=max_evaluation_steps,
-			max_training_steps=max_training_steps,
-		)
 
-	def configure_model(self) -> TrainerConfigureModelOutput:
-		"""
-		Configures the model, optimizer, scheduler, and configuration.
+		prompt_input_ids = processed_features["input_ids"][0]
+		pixel_values = processed_features["pixel_values"][0]
+		chosen_input_ids = tokenizer(
+			features["chosen"],
+			add_special_tokens=False,
+			return_tensors="jax",
+		)["input_ids"]
+		rejected_input_ids = tokenizer(
+			features["rejected"],
+			add_special_tokens=False,
+			return_tensors="jax",
+		)["input_ids"]
 
-		This method retrieves the model configuration from the model state, creates
-		the optimizer and scheduler using the training arguments, and returns an
-		object containing the configured model, optimizer, scheduler, and configuration.
+		if add_special_tokens:
+			if tokenizer.bos_token_id is not None:
+				prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
+			if tokenizer.eos_token_id is not None:
+				prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+		chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
+		rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
 
-		Returns:
-				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
-		"""
-		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
-		if self.pruning_module is not None:
-			tx = self.pruning_module.wrap_optax(tx)
-		return TrainerConfigureModelOutput(
-			model=self.model,
-			tx=tx,
-			scheduler=scheduler,
-			config=self.model.config,
-		)
+		if max_prompt_length is not None:
+			prompt_input_ids = prompt_input_ids[-max_prompt_length:]
+		if max_completion_length is not None:
+			chosen_input_ids = chosen_input_ids[:max_completion_length]
+			rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+		output = {
+			"prompt_input_ids": prompt_input_ids,
+			"pixel_values": pixel_values,
+			"chosen_input_ids": chosen_input_ids,
+			"rejected_input_ids": rejected_input_ids,
+		}
+
+		if "pixel_attention_mask" in processed_features:
+			output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
+		if "image_sizes" in processed_features:
+			output["image_sizes"] = processed_features["image_sizes"][0]
+
+		return output
 
 	def configure_functions(self) -> TrainerConfigureFunctionOutput:
 		"""
 		Configures and JIT-compiles the training and evaluation step functions.
 
 		This method sets up the necessary functions for training and evaluation, including:
-				- Initialization of the model state.
-				- Sharding of the model parameters and optimizer state.
-				- JIT-compilation of the training and evaluation step functions.
+		    - Initialization of the model state.
+		    - Sharding of the model parameters and optimizer state.
+		    - JIT-compilation of the training and evaluation step functions.
 
 		Returns:
-				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		mesh = self.model.mesh
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
-			mesh=mesh,
-		)
-		input_sharding = jax.sharding.NamedSharding(
-			spec=self.arguments.step_partition_spec,
 			mesh=mesh,
 		)
 		# returns chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits
@@ -290,18 +367,23 @@ class DPOTrainer(Trainer):
 		partial_concatenated_forward = partial(
 			concatenated_forward,
 			is_encoder_decoder=self.arguments.is_encoder_decoder,
-			padding_value=self.arguments.padding_value,
+			padding_value=self.padding_value,
 			label_pad_token_id=self.arguments.label_pad_token_id,
-			fixed_max_length=self.arguments.max_length,
+			max_length=self.arguments.max_length,
+			loss_type=self.arguments.loss_type,
+			aux_loss_enabled=self.arguments.aux_loss_enabled,
+			truncation_mode=self.arguments.truncation_mode,
 		)
 		jited_concatenated_forward = jax.jit(
 			partial_concatenated_forward,
-			# in_shardings=(self.state_shardings.model, input_sharding),
-			out_shardings=(empty_sharding, empty_sharding, empty_sharding, empty_sharding),
+			out_shardings=(empty_sharding,),
 			static_argnames=[
 				"is_encoder_decoder",
 				"padding_value",
 				"label_pad_token_id",
+				"aux_loss_enabled",
+				"truncation_mode",
+				"loss_type",
 			],
 		)
 		sharded_training_step_function = jax.jit(
@@ -309,18 +391,21 @@ class DPOTrainer(Trainer):
 				training_step,
 				learning_rate_fn=self.scheduler,
 				concatenated_forward=partial_concatenated_forward,
-				reference_state=self.reference_state,
 				beta=self.arguments.beta,
 				label_smoothing=self.arguments.label_smoothing,
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
 			),
-			in_shardings=(self.state_shardings, input_sharding),
+			in_shardings=(
+				self.state_shardings,
+				empty_sharding,
+				self.reference_state.shardings,
+			),
 			out_shardings=(self.state_shardings, empty_sharding),
+			donate_argnums=(0,),
 			static_argnames=[
 				"learning_rate_fn",
 				"concatenated_forward",
-				"reference_state",
 				"beta",
 				"label_smoothing",
 				"loss_type",
@@ -338,11 +423,14 @@ class DPOTrainer(Trainer):
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
 			),
-			in_shardings=(self.state_shardings, input_sharding),
+			in_shardings=(
+				self.state_shardings,
+				empty_sharding,
+				self.reference_state.shardings,
+			),
 			out_shardings=empty_sharding,
 			static_argnames=[
 				"concatenated_forward",
-				"reference_state",
 				"beta",
 				"label_smoothing",
 				"loss_type",
@@ -371,93 +459,16 @@ class DPOTrainer(Trainer):
 		For DPO training, this method simply returns the pre-configured `data_collator`.
 
 		Args:
-				max_sequence_length (int): The maximum sequence length (not used in this implementation).
-				truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
-						The truncation mode (not used in this implementation). Defaults to "keep_end".
+		    max_sequence_length (int): The maximum sequence length (not used in this implementation).
+		    truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+		        The truncation mode (not used in this implementation). Defaults to "keep_end".
 
 		Returns:
-				tp.Callable: The data collator function.
+		    tp.Callable: The data collator function.
 		"""
-		return self.data_collator
+		return self.input_data_collator
 
-	def _get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
-		"""
-		Creates the training dataloader as a TensorFlow Dataset.
-
-		This method retrieves the training dataset, applies the data collator, and converts
-		it into a TensorFlow Dataset for efficient batching and data loading during training.
-
-		Returns:
-				tensorflow.data.Dataset: The training dataloader.
-
-		Raises:
-				ValueError: If the training dataset is not set.
-		"""
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-		if self.train_dataset is None:
-			raise ValueError("Trainer: training requires a train_dataset.")
-
-		train_dataset = self.train_dataset
-		data_collator = self.data_collator
-
-		return tensorflow_datasets.as_numpy(
-			train_dataset.to_tf_dataset(
-				batch_size=self.training_batch_size,
-				collate_fn=data_collator,
-				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=True,
-				drop_remainder=True,
-			)
-		)
-
-	def _get_eval_dataloader(
-		self,
-		eval_dataset: tp.Optional["Dataset"] = None,  # noqa #type:ignore
-	) -> "tensorflow.data.Dataset":  # noqa #type:ignore
-		"""
-		Creates the evaluation dataloader as a TensorFlow Dataset.
-
-		This method retrieves the evaluation dataset (either provided as an argument or
-		from the `self.eval_dataset` attribute), applies the data collator, and converts
-		it into a TensorFlow Dataset for efficient batching and data loading during evaluation.
-
-		Args:
-				eval_dataset (tp.Optional[Dataset], optional):
-						An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
-
-		Returns:
-				tensorflow.data.Dataset: The evaluation dataloader.
-
-		Raises:
-				ValueError: If no evaluation dataset is provided or set.
-		"""
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		if eval_dataset is None and self.eval_dataset is None:
-			raise ValueError("Trainer: evaluation requires an eval_dataset.")
-		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-		return tensorflow_datasets.as_numpy(
-			eval_dataset.to_tf_dataset(
-				batch_size=self.evaluation_batch_size,
-				collate_fn=self.data_collator,
-				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=False,
-				drop_remainder=True,
-			)
-		)
-
-	def get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
+	def configure_dataloaders(self):
 		"""
 		Returns the training dataloader, potentially with precomputed reference log probabilities.
 
@@ -466,7 +477,7 @@ class DPOTrainer(Trainer):
 		them as columns to the dataset.
 
 		Returns:
-				tensorflow.data.Dataset: The training dataloader.
+		    tensorflow.data.Dataset: The training dataloader.
 		"""
 
 		try:
@@ -475,119 +486,89 @@ class DPOTrainer(Trainer):
 			raise ImportError(
 				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
 			) from e
-
-		if (
-			self.arguments.precompute_ref_log_probs
-			and not self._precomputed_train_ref_log_probs
-		):
-			data_loader = tensorflow_datasets.as_numpy(
-				self.train_dataset.to_tf_dataset(
-					batch_size=self.training_batch_size,
-					collate_fn=self.data_collator,
-					num_workers=self.arguments.dataloader_num_workers,
-					shuffle=False,
-					drop_remainder=True,
-				)
-			)
-			reference_chosen_log_probs = []
-			ref_rejected_logps = []
-			for padded_batch in tqdm(
-				iterable=data_loader, desc="Train dataset reference log probs"
+		if self.train_dataset is not None:
+			if (
+				self.arguments.precompute_ref_log_probs
+				and not self._precomputed_train_ref_log_probs
 			):
-				reference_chosen_logp, reference_rejected_logp = (
-					self.compute_reference_log_probs(
-						self.model_state,
-						padded_batch,
+				data_loader = tensorflow_datasets.as_numpy(
+					self.train_dataset.to_tf_dataset(
+						batch_size=self.training_batch_size,
+						collate_fn=self.input_data_collator,
+						num_workers=self.arguments.dataloader_num_workers,
+						shuffle=False,
+						drop_remainder=True,
 					)
 				)
-				reference_chosen_log_probs.append(reference_chosen_logp)
-				ref_rejected_logps.append(reference_rejected_logp)
+				reference_chosen_log_probs = []
+				ref_rejected_logps = []
+				for padded_batch in tqdm(
+					iterable=data_loader,
+					desc="Train dataset reference log probs",
+				):
+					reference_chosen_logp, reference_rejected_logp = (
+						self.compute_reference_log_probs(
+							self.model_state,
+							padded_batch,
+						)
+					)
+					reference_chosen_log_probs.append(reference_chosen_logp)
+					ref_rejected_logps.append(reference_rejected_logp)
 
-			all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-			all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
-			self.train_dataset = self.train_dataset.add_column(
-				name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
-			)
-			self.train_dataset = self.train_dataset.add_column(
-				name="ref_rejected_logps",
-				column=all_ref_rejected_logps,
-			)
-
-			self._precomputed_train_ref_log_probs = True
-		return self._get_train_dataloader()
-
-	def get_eval_dataloader(
-		self,
-		eval_dataset: tp.Optional["Dataset"] = None,  # noqa #type:ignore
-	) -> "tensorflow.data.Dataset":  # noqa #type:ignore
-		"""
-		Returns the evaluation dataloader, potentially with precomputed reference log probabilities.
-
-		If `precompute_ref_log_probs` is enabled, this method computes the reference model's log
-		probabilities for the chosen and rejected responses in the evaluation dataset and adds
-		them as columns to the dataset.
-
-		Args:
-				eval_dataset (tp.Optional[Dataset], optional):
-						An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
-
-		Returns:
-				tensorflow.data.Dataset: The evaluation dataloader.
-		"""
-
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		if eval_dataset is None and self.eval_dataset is None:
-			raise ValueError("Trainer: evaluation requires an eval_dataset.")
-		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-		if (
-			self.arguments.precompute_ref_log_probs
-			and not self._precomputed_eval_ref_log_probs
-		):
-			# prepare dataloader
-			data_loader = tensorflow_datasets.as_numpy(
-				eval_dataset.to_tf_dataset(
-					batch_size=self.evaluation_batch_size,
-					collate_fn=self.data_collator,
-					num_workers=self.arguments.dataloader_num_workers,
-					shuffle=False,
-					drop_remainder=True,
+				all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
+				all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+				self.train_dataset = self.train_dataset.add_column(
+					name="reference_chosen_log_probs",
+					column=all_reference_chosen_log_probs,
 				)
-			)
+				self.train_dataset = self.train_dataset.add_column(
+					name="ref_rejected_logps",
+					column=all_ref_rejected_logps,
+				)
 
-			reference_chosen_log_probs = []
-			ref_rejected_logps = []
-			for padded_batch in tqdm(
-				iterable=data_loader, desc="Eval dataset reference log probs"
+				self._precomputed_train_ref_log_probs = True
+		if self.eval_dataset is not None:
+			if (
+				self.arguments.precompute_ref_log_probs
+				and not self._precomputed_eval_ref_log_probs
 			):
-				reference_chosen_logp, reference_rejected_logp = (
-					self.compute_reference_log_probs(self.model_state, padded_batch)
+				data_loader = tensorflow_datasets.as_numpy(
+					self.eval_dataset.to_tf_dataset(
+						batch_size=self.evaluation_batch_size,
+						collate_fn=self.input_data_collator,
+						num_workers=self.arguments.dataloader_num_workers,
+						shuffle=False,
+						drop_remainder=True,
+					)
 				)
-				reference_chosen_log_probs.append(reference_chosen_logp.cpu())
-				ref_rejected_logps.append(reference_rejected_logp.cpu())
+				reference_chosen_log_probs = []
+				ref_rejected_logps = []
+				for padded_batch in tqdm(
+					iterable=data_loader,
+					desc="Eval dataset reference log probs",
+				):
+					reference_chosen_logp, reference_rejected_logp = (
+						self.compute_reference_log_probs(
+							self.model_state,
+							padded_batch,
+						)
+					)
+					reference_chosen_log_probs.append(reference_chosen_logp)
+					ref_rejected_logps.append(reference_rejected_logp)
 
-			all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-			all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+				all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
+				all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+				self.eval_dataset = self.eval_dataset.add_column(
+					name="reference_chosen_log_probs",
+					column=all_reference_chosen_log_probs,
+				)
+				self.eval_dataset = self.eval_dataset.add_column(
+					name="ref_rejected_logps",
+					column=all_ref_rejected_logps,
+				)
 
-			eval_dataset = eval_dataset.add_column(
-				name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
-			)
-			eval_dataset = eval_dataset.add_column(
-				name="ref_rejected_logps",
-				column=all_ref_rejected_logps,
-			)
-
-			if self.eval_dataset is not None:
-				self.eval_dataset = eval_dataset
-			self._precomputed_eval_ref_log_probs = True
-
-		return self._get_eval_dataloader(eval_dataset=eval_dataset)
+				self._precomputed_train_ref_log_probs = True
+		return super().configure_dataloaders()
 
 	def compute_reference_log_probs(
 		self,
@@ -598,11 +579,11 @@ class DPOTrainer(Trainer):
 		Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset.
 
 		Args:
-				state (EasyDeLState): The EasyDeLState object of the model (used if no reference model is provided).
-				padded_batch (tp.Dict): The padded batch of data.
+		    state (EasyDeLState): The EasyDeLState object of the model (used if no reference model is provided).
+		    padded_batch (tp.Dict): The padded batch of data.
 
 		Returns:
-				tuple[tp.Any, tp.Any]: A tuple containing the log probabilities for the chosen and rejected responses.
+		    tuple[tp.Any, tp.Any]: A tuple containing the log probabilities for the chosen and rejected responses.
 		"""
 
 		if self.reference_state is None:
@@ -611,48 +592,88 @@ class DPOTrainer(Trainer):
 			outs = self.concatenated_forward(self.reference_state.model, batch=padded_batch)
 		return outs["chosen_logps"], outs["rejected_logps"]
 
-	def _execute_eval_step(self, state: EasyDeLState, batch) -> LossMetrics:
-		"""Execute a single eval step."""
-		batch = {key: jnp.asarray(value) for key, value in batch.items()}
+	def _execute_eval_step(self, state, batch) -> LossMetrics:
+		"""
+		Executes a single evaluation step.
 
-		metrics = self.sharded_evaluation_step_function(state, batch)
+		Args:
+		    state: The current model state.
+		    batch: A processed batch of evaluation data.
+
+		Returns:
+		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
+		"""
+		metrics = self.sharded_evaluation_step_function(
+			state,
+			batch,
+			self.reference_state,
+		)
 		return metrics
 
 	def _execute_train_step(
-		self, state: EasyDeLState, batch
+		self,
+		state,
+		batch,
 	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
-		"""Execute a single training step."""
+		"""
+		Executes a single training step.
+
+		This function optionally updates the model's pruning module before and after the gradient step.
+		It then calls the sharded training step function to compute the gradients and update the state.
+		If an exception occurs (e.g. KeyboardInterrupt, timer error, or break request), it is captured and returned.
+
+		Args:
+		    state: The current model state.
+		    batch: A processed batch of training data.
+
+		Returns:
+		    A tuple containing:
+		        - The updated model state.
+		        - The computed LossMetrics.
+		        - An exception instance if one was raised during execution; otherwise, None.
+		"""
+		if self.pruning_module is not None:
+			state = state.replace(
+				graphstate=self.pruning_module.pre_forward_update(
+					state.graphstate,
+					state.opt_state,
+				)
+			)
+		metrics = LossMetrics()
 		try:
-			batch = {key: jnp.asarray(value) for key, value in batch.items()}
-			state, metrics = self.sharded_training_step_function(state, batch)
+			state, metrics = jax.block_until_ready(
+				self.sharded_training_step_function(
+					state,
+					batch,
+					self.reference_state,
+				)
+			)
+			# Apply post-gradient updates via the pruning module, if present.
+			if self.pruning_module is not None:
+				state = state.replace(
+					graphstate=self.pruning_module.post_gradient_update(
+						state.graphstate,
+						state.opt_state,
+					)
+				)
 			return state, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
 			return state, metrics, run_exception
 
+	def on_step_end(
+		self,
+		state: EasyDeLState,
+		metrics: MetricsType,
+		step: int,
+	) -> tp.Tuple[EasyDeLState, MetricsType]:
+		"""hook process to call in start of the step."""
 
-def check_unimplemented_abstract_methods():
-	from inspect import getmembers, isfunction
-
-	base_class = BaseTrainer
-	derived_class = DPOTrainer
-	abstract_methods = [
-		method
-		for method in getmembers(base_class, predicate=isfunction)
-		if getattr(getattr(base_class, method[0]), "__isabstractmethod__", False)
-	]
-
-	not_implemented = [
-		method[0]
-		for method in abstract_methods
-		if getattr(derived_class, method[0]) is getattr(base_class, method[0])
-	]
-	if len(not_implemented) != 0:
-		warnings.warn(
-			f"{DPOConfig.__name__} does not implement the following abstract methods: {', '.join(not_implemented)}. "
-			f"Please ensure these methods are implemented in {DPOConfig.__name__}.",
-			stacklevel=1,
-			category=UserWarning,
-		)
-
-
-check_unimplemented_abstract_methods()
+		if (
+			self.arguments.sync_ref_model
+			and self.reference_state is not None
+			and (step % self.arguments.ref_model_sync_steps == 0)
+		):
+			self.reference_state = self.reference_state.replace(
+				graphstate=deepcopy_model(state.graphstate)
+			)
+		return state, metrics

@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import functools
 import gc
 import os
 import typing as tp
-from contextlib import contextmanager
+import warnings
 
 import jax
-from fjformer.checkpoint import get_dtype
+import jax.extend
+import numpy as np
 from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
@@ -39,24 +42,63 @@ else:
 	EasyDeLBaseModule = tp.Any
 	EasyDeLBaseConfig = tp.Any
 
+
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
 
+EASYDEL_PERFRED_HOST_COPY_INDEX = int(
+	os.environ.get("EASYDEL_PERFRED_HOST_COPY_INDEX", "0")
+)
+EASYDEL_PERFRED_HOST_COPY = str(
+	os.environ.get("EASYDEL_PERFRED_HOST_COPY", "cpu")
+).lower()
+
+EASYDEL_PERFRED_HOST_COPY = (
+	None if EASYDEL_PERFRED_HOST_COPY == "none" else EASYDEL_PERFRED_HOST_COPY
+)
+
+
+def get_dtype(dtype):
+	if isinstance(dtype, str):
+		dtype = {
+			"bf16": jnp.bfloat16,
+			"bfloat16": jnp.bfloat16,
+			"fp16": jnp.float16,
+			"float16": jnp.float16,
+			"fp32": jnp.float32,
+			"float32": jnp.float32,
+			"fp64": jnp.float64,
+			"float64": jnp.float64,
+			"fp8": jnp.float8_e5m2,
+			"fp8_e4m3fn": jnp.float8_e4m3fn,
+			"fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
+			"fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+			"fp8_e5m2": jnp.float8_e5m2,
+			"fp8_e5m2fnuz": jnp.float8_e5m2fnuz,
+			"float8_e4m3fn": jnp.float8_e4m3fn,
+			"float8_e4m3fnuz": jnp.float8_e4m3fnuz,
+			"float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+			"float8_e5m2": jnp.float8_e5m2,
+			"float8_e5m2fnuz": jnp.float8_e5m2fnuz,
+		}[dtype]
+	return dtype
+
 
 def float_tensor_to_dtype(tensor, dtype):
-	"""
-	The float_tensor_to_dtype function is used to convert a tensor's dtype to the specified dtype.
-
-	"""
 	if dtype is None or dtype == "":
 		return tensor
 	if isinstance(dtype, str):
 		dtype = get_dtype(dtype)
 	float_dtypes = (
-		jax.numpy.bfloat16,
-		jax.numpy.float16,
-		jax.numpy.float32,
-		jax.numpy.float64,
+		jnp.bfloat16,
+		jnp.float16,
+		jnp.float32,
+		jnp.float64,
+		jnp.float8_e4m3fn,
+		jnp.float8_e4m3fnuz,
+		jnp.float8_e4m3b11fnuz,
+		jnp.float8_e5m2,
+		jnp.float8_e5m2fnuz,
 	)
 	if getattr(tensor, "dtype", None) in float_dtypes:
 		tensor = tensor.astype(dtype)
@@ -92,14 +134,9 @@ def match_keywords(string, ts, ns):
 	return True
 
 
-@contextmanager
-def _dummy_context_manager():
-	yield
-
-
 def process_tensor(
 	key: str, tensor: tp.Any, config: tp.Dict[str, tp.Any]
-) -> tp.Optional[tp.Tuple[tuple, jax.numpy.ndarray]]:
+) -> tp.Optional[tp.Tuple[tuple, jnp.ndarray]]:
 	"""
 	Process a single tensor and return its processed key and value.
 
@@ -114,11 +151,7 @@ def process_tensor(
 	new_key = key
 	# Handle embedding layers
 	if any(layer_name in key for layer_name in config["embedding_layer_names"]):
-		new_key = f"{key[:-len('.weight')]}.embedding"
-
-	# Handle RNN/RWKV specific tensors
-	elif config["rnn_based_or_rwkv"] and any(x in key for x in ["time_mix_", "time_"]):
-		tensor = tensor.reshape(-1)
+		new_key = f"{key[: -len('.weight')]}.embedding"
 
 	# Handle layer normalization
 
@@ -131,10 +164,10 @@ def process_tensor(
 		match ndim:
 			case 2:
 				# linear layers
-				tensor = tensor.transpose(0, 1)
+				tensor = tensor.permute(1, 0)
 			case 3:
 				# 1d conv layers
-				tensor = tensor.transpose(0, 2)
+				tensor = tensor.permute(2, 1, 0)
 			case 4:
 				# 2d conv layers
 				tensor = tensor.permute(2, 3, 1, 0)
@@ -168,10 +201,10 @@ def torch_dict_to_easydel_params(
 	device: tp.Optional[jax.Device] = None,
 	embedding_layer_names: tp.Optional[tp.List[str]] = None,
 	layernorm_names: tp.Optional[tp.List[str]] = None,
-	rnn_based_or_rwkv: bool = False,
 	shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable]] = None,
-	dtype: jax.numpy.dtype = jnp.float16,
+	dtype: jnp.dtype = jnp.float16,
 	verbose: bool = True,
+	callback: tp.Optional[tp.Callable[[jax.Array, tuple], jax.Array]] = None,
 	remove_state_dict: bool = False,
 	lm_head_name: tp.Optional[str] = None,
 	uses_tie_word_embedding: bool = False,
@@ -185,12 +218,12 @@ def torch_dict_to_easydel_params(
 	    device: JAX device to use
 	    embedding_layer_names: Names of embedding layers
 	    layernorm_names: Names of layer normalization layers
-	    rnn_based_or_rwkv: Whether model is RNN-based or RWKV
 	    shard_fns: tp.Mapping of parameter names to sharding functions
 	    block_size: Size of processing blocks
 	    params_pattern_selection: Regex pattern for parameter selection
 	    dtype: Target dtype for parameters
 	    verbose: Whether to show progress bar
+			callback: callback for tensors after they are converted to a jax array.
 	    remove_state_dict: Whether to delete state_dict after conversion
 	    lm_head_name: Name of language model head
 	    uses_tie_word_embedding: Whether model uses tied embeddings
@@ -210,19 +243,22 @@ def torch_dict_to_easydel_params(
 	config = {
 		"embedding_layer_names": set(embedding_layer_names or []),
 		"layernorm_names": set(layernorm_names or []),
-		"rnn_based_or_rwkv": rnn_based_or_rwkv,
 		"lm_head_name": lm_head_name,
 		"uses_tie_word_embedding": uses_tie_word_embedding,
 		"dtype": dtype,
 	}
+	cmg = (
+		jax.default_device(device)
+		if device is not None and shard_fns is None
+		else contextlib.nullcontext()
+	)
 
-	device = device or jax.devices()[0]
-	ctx_m = jax.default_device(device) if shard_fns is None else _dummy_context_manager()
-
-	with ctx_m:
+	with cmg:
 		flax_dict = {}
 		with tqdm(
-			total=len(state_dict), disable=not verbose, desc="Converting Model"
+			total=len(state_dict),
+			disable=not verbose,
+			desc="Converting Model",
 		) as pbar:
 			for key, tensor in state_dict.items():
 				try:
@@ -231,9 +267,10 @@ def torch_dict_to_easydel_params(
 						key_tuple, jax_array = result
 						if shard_fns and key_tuple in shard_fns:
 							jax_array = shard_fns[key_tuple](jax_array)
+						if callback is not None:
+							jax_array = callback(jax_array, key_tuple)
 						flax_dict[key_tuple] = jax_array
 				except Exception as e:
-					raise e
 					print(f"Error processing key {key}: {str(e)}")
 				pbar.update(1)
 
@@ -244,69 +281,52 @@ def torch_dict_to_easydel_params(
 		return unflatten_dict(flax_dict)
 
 
-def module_to_torch(
-	module: EasyDeLBaseModule,
-	dtype: jnp.dtype = jnp.float16,
-	transpose_needed: tp.Optional[tp.Dict] = None,
-	transpose_not_needed: tp.Optional[tp.Dict] = None,
-	rnn_based_or_rwkv: bool = False,
-):
+def module_to_torch(module: EasyDeLBaseModule, dtype: jnp.dtype = jnp.float16):
 	if dtype is None:
 		dtype = module.param_dtype
-	if transpose_needed is None:
-		transpose_needed = ["kernel"]
-	if transpose_not_needed is None:
-		transpose_not_needed = ["none"]
-
-	def match_keywords(string, do_transpose, dont_transpose):
-		for dtr in do_transpose:
-			if dtr not in string:
-				return False
-		for ntr in dont_transpose:
-			if ntr in string:
-				return False
-		return True
 
 	graphtree = unflatten_dict(module.parameters)
 	model_parameters = flatten_dict(graphtree, sep=".")
 	torch_state_dict = {}
 	pbar = tqdm(
-		model_parameters.items(), desc="Converting EasyDeLBaseModule to torch state_dict"
+		model_parameters.items(),
+		desc="Converting EasyDeLBaseModule to torch state_dict",
 	)
 	for key, tensor in pbar:
 		if tensor is None:
 			continue
-		if match_keywords(key, transpose_needed, transpose_not_needed):
-			ndim = tensor.ndim
-			match ndim:
+
+		if tensor.dtype != get_dtype(dtype):
+			if hasattr(tensor, "materialize"):
+				tensor = tensor.materialize()
+			if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
+				tensor = tensor.value.materialize()
+			tensor = tensor.astype(get_dtype(dtype))
+
+		tensor = jax2pt(jax.block_until_ready(tensor))
+
+		if key.endswith(".kernel"):
+			match tensor.ndim:
 				case 2:
-					# linear layers
-					tensor = jnp.swapaxes(tensor, 0, 1)  # Same as PT->JAX since it's symmetric
+					tensor = tensor.permute(1, 0)
 				case 3:
-					# 1d conv layers
-					tensor = jnp.swapaxes(tensor, 0, 2)  # Same as PT->JAX since it's symmetric
+					tensor = tensor.permute(2, 1, 0)
 				case 4:
-					# 2d conv layers
-					tensor = jnp.transpose(tensor, (3, 2, 0, 1))  # Reverse of (2,3,1,0)
+					tensor = tensor.permute(3, 2, 0, 1)
 				case 5:
-					# 3d conv layers
-					tensor = jnp.transpose(tensor, (4, 3, 0, 1, 2))  # Reverse of (2,3,4,1,0)
+					tensor = tensor.permute(4, 3, 0, 1, 2)
 				case 6:
-					# 4d conv layers
-					tensor = jnp.transpose(tensor, (5, 4, 3, 2, 0, 1))  # Reverse of (4,5,3,2,1,0)
+					tensor = tensor.permute(5, 4, 3, 2, 0, 1)
 				case _:
 					...
-		elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
-			tensor = tensor.reshape(1, 1, -1)
-		if tensor.dtype != get_dtype(dtype):
-			tensor = tensor.astype(get_dtype(dtype))  # ignores double allocation on GPUs
+
 		key = (
 			key.replace(".kernel", ".weight")
 			.replace(".embedding", ".weight")
 			.replace(".scale", ".weight")
 		)
 
-		torch_state_dict[key] = jax2pt(tensor)
+		torch_state_dict[key] = tensor
 	return torch_state_dict
 
 
@@ -315,95 +335,76 @@ def module_to_huggingface_model(
 	config: EasyDeLBaseConfig,
 	base_huggingface_module: PreTrainedModel,
 	base_huggingface_module_kwarguments: tp.Optional[tp.Dict] = None,
-	dtype=jnp.float16,
-	transpose_needed: tp.Optional[tp.List] = None,
-	transpose_not_needed=None,
-	rnn_based_or_rwkv: bool = False,
-	auto_correct: bool = True,
+	dtype: jnp.dtype = jnp.float16,
 	use_meta_torch: bool = True,
+	**kw,
 ):
-	if not rnn_based_or_rwkv and auto_correct:
-		import transformers
-
-		if isinstance(base_huggingface_module, transformers.RwkvForCausalLM) or isinstance(
-			base_huggingface_module, transformers.RwkvModel
-		):
-			logger.warning(
-				"Rnn Based Model detected 'setting `rnn_based_or_rwkv = True`' for correct weight handling"
-			)
-			rnn_based_or_rwkv = True
 	if base_huggingface_module_kwarguments is None:
 		base_huggingface_module_kwarguments = {}
 
-	if auto_correct:
-		for k, v in config.__dict__.items():
-			if not hasattr(config, k):
-				setattr(config, k, v)
-
-	state_dict = module_to_torch(
-		module=module,
-		dtype=dtype,
-		transpose_needed=transpose_needed,
-		transpose_not_needed=transpose_not_needed,
-		rnn_based_or_rwkv=rnn_based_or_rwkv,
-	)
+	state_dict = module_to_torch(module=module, dtype=dtype)
 	import torch
 
-	if use_meta_torch:
-		with torch.device("meta"):
-			model = base_huggingface_module(
-				config=config,
-				**base_huggingface_module_kwarguments,
-			)
-		model.load_state_dict(
-			state_dict,
-			assign=True,
-			strict=True,
-		)
-	else:
-		model = base_huggingface_module(
-			config=config,
+	base_config = base_huggingface_module.config_class.from_dict(config.to_dict())
+	ctxm = torch.device("meta") if use_meta_torch else contextlib.nullcontext()
+	with ctxm:
+		model: torch.nn.Module = base_huggingface_module(
+			config=base_config,
 			**base_huggingface_module_kwarguments,
 		)
-		model.load_state_dict(
-			state_dict,
-			assign=True,
-			strict=True,
-		)
+		key_shape_checks = {
+			k: v.shape for k, v in model.state_dict().items() if hasattr(v, "shape")
+		}
+		if len(list(key_shape_checks.keys())) != len(list(state_dict.keys())):
+			warnings.warn(
+				"There might be an issue with converted `state_dict`.", stacklevel=1
+			)
+		for key, shape in key_shape_checks.items():
+			if state_dict[key].shape != shape:
+				warnings.warn(f"Shape conflict at {key}.", stacklevel=1)
+		model.load_state_dict(state_dict, assign=True, strict=True)
 	return model
 
 
+@functools.lru_cache
+def get_torch():
+	import torch
+
+	return torch
+
+
 def jax2pt(x: jax.Array):
-	from torch import cuda
-	from torch.utils import dlpack as dlpack_pt
-
-	_jax_device = list(x.devices())[0].platform
-	cpu_force = not cuda.is_available()
-	if (
-		_jax_device in ["cpu", "gpu"]
-		and not cpu_force
-		and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
-	):
-		dl_pack_jax = dlpack.to_dlpack(
-			x,
-			stream=True if (_jax_device == "gpu" and not cpu_force) else None,
-			src_device=list(x.devices())[0],
-		)
+	if os.environ.get("EASY_SAFE_TRANSFER", "true") in ["true", "yes", "1", "on"]:
+		x = jax.device_get(x)
+		return get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
 	else:
-		device = os.environ.get("EASYDEL_PERFRED_HOST_COPY", "cpu")
-		if device.lower() == "none":
-			device = None  # Auto JAX Select
-		perfred_host = jax.devices(device)[
-			int(os.environ.get("EASYDEL_PERFRED_HOST_COPY_IDEX", "0"))
-		]
-		x = jax.device_get(x)  # make sure it's local
-		x = jax.device_put(x, perfred_host)
-		dl_pack_jax = dlpack.to_dlpack(
-			x,
-			stream=None,
-		)
-	return dlpack_pt.from_dlpack(dl_pack_jax)
+		# This one causes a lot of funny bugs, where weights in state_dict are same (both in cpp and python)
+		#  but estimated correct elements are ~85%
+		from torch import cuda
+		from torch.utils import dlpack as dlpack_pt
+
+		platform = jax.extend.backend.get_backend()
+		cpu_force = not cuda.is_available()
+		if (
+			platform in ["cpu", "gpu"]
+			and not cpu_force
+			and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
+		):
+			dl_pack_jax = dlpack.to_dlpack(
+				x,
+				stream=True if (platform == "gpu" and not cpu_force) else None,
+				src_device=list(x.devices())[0],
+			)
+		else:
+			dl_pack_jax = dlpack.to_dlpack(
+				jax.device_put(
+					jax.device_get(x),
+					jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
+				),
+				stream=None,
+			)
+		return dlpack_pt.from_dlpack(dl_pack_jax)
 
 
-def pt2jax(x, transpose_raw: tp.Optional[tuple] = None):
-	return jax.numpy.asarray(x.detach().cpu().numpy())
+def pt2jax(x):
+	return jnp.asarray(x.detach().cpu().numpy())

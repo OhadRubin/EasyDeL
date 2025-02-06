@@ -49,7 +49,6 @@ class ModuleRegistration:
 	config: type[EasyDeLBaseConfig]
 	embedding_layer_names: tp.Optional[tp.List[str]] = None
 	layernorm_names: tp.Optional[tp.List[str]] = None
-	rnn_based_or_rwkv: bool = False
 
 
 class Registry:
@@ -97,7 +96,6 @@ class Registry:
 		model_type: str,
 		embedding_layer_names: tp.Optional[tp.List[str]] = None,
 		layernorm_names: tp.Optional[tp.List[str]] = None,
-		rnn_based_or_rwkv: bool = False,
 	) -> callable:
 		"""
 		Register a module for a specific task.
@@ -108,7 +106,6 @@ class Registry:
 		    model_type: Identifier for the model
 		    embedding_layer_names: Names of embedding layers
 		    layernorm_names: Names of layer normalization layers
-		    rnn_based_or_rwkv: Whether the model is RNN-based or RWKV
 
 		Returns:
 		    Decorator function
@@ -122,7 +119,6 @@ class Registry:
 				config=config,
 				embedding_layer_names=embedding_layer_names,
 				layernorm_names=layernorm_names,
-				rnn_based_or_rwkv=rnn_based_or_rwkv,
 			)
 			return module
 
@@ -149,7 +145,14 @@ class Registry:
 		],
 		model_type: str,
 	) -> ModuleRegistration:
-		return self._task_registry[task_type][model_type]
+		task_in = self._task_registry.get(task_type, None)
+		assert task_in is not None, f"task type {task_type} is not defined."
+		type_in = task_in.get(model_type, None)
+		assert (
+			type_in is not None
+		), f"model type {model_type} is not defined. (upper task {task_type})"
+
+		return type_in
 
 	@property
 	def task_registry(self):

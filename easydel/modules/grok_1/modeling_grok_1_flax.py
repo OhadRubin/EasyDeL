@@ -20,11 +20,11 @@ from functools import cached_property
 import chex
 import jax
 import jax.numpy as jnp
-from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	MoeCausalLMOutput,
 	MoeModelOutput,
@@ -48,7 +48,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		layer_index: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -255,7 +255,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 		config: Grok1Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -313,7 +313,7 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 		config: Grok1Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -364,7 +364,6 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 					self.layers[index],
 					hidden_states,
 					self.config.scan_mlp_chunk_size,
-					False,
 				)
 				if self.config.use_scan_mlp
 				else self.layers[index](hidden_states)
@@ -385,7 +384,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 		config: Grok1Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -520,7 +519,7 @@ class Grok1Model(EasyDeLBaseModule):
 		config: Grok1Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -695,7 +694,7 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 		config: Grok1Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):

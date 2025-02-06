@@ -17,6 +17,8 @@ import typing as tp
 from functools import partial
 
 import jax
+import jax.experimental
+import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import msgpack
 import safetensors
@@ -49,9 +51,8 @@ ALLOWED_DATA_TYPES = [
 ]
 
 
-def get_dtype(
-	array: jax.Array,
-	dtype: tp.Optional[tp.Union[str, jnp.dtype]],
+def put_dtype(
+	array: jax.Array, dtype: tp.Optional[tp.Union[str, jnp.dtype]]
 ) -> jax.Array:
 	"""
 	Get the tensor with the specified data type.
@@ -76,7 +77,18 @@ def get_dtype(
 			"float32": jnp.float32,
 			"fp64": jnp.float64,
 			"float64": jnp.float64,
-		}
+			"fp8": jnp.float8_e5m2,
+			"fp8_e4m3fn": jnp.float8_e4m3fn,
+			"fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
+			"fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+			"fp8_e5m2": jnp.float8_e5m2,
+			"fp8_e5m2fnuz": jnp.float8_e5m2fnuz,
+			"float8_e4m3fn": jnp.float8_e4m3fn,
+			"float8_e4m3fnuz": jnp.float8_e4m3fnuz,
+			"float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+			"float8_e5m2": jnp.float8_e5m2,
+			"float8_e5m2fnuz": jnp.float8_e5m2fnuz,
+		}[dtype]
 		try:
 			dtype = dtype_map[dtype]
 		except KeyError as e:
@@ -93,6 +105,7 @@ def _read_process_array(
 	mismatch_allowed,
 	manager,
 	callback: tp.Optional[tp.Callable[[jax.Array, str], jax.Array]] = None,
+	dtype: tp.Optional[tp.Union[str, jnp.dtype]] = None,
 ):
 	"""Helper function to process a single tensor from a checkpoint."""
 	tensor = manager.get_tensor(key)
@@ -115,6 +128,7 @@ def _read_process_array(
 
 	if callback:
 		tensor = callback(tensor, key)
+	tensor = put_dtype(tensor, dtype)
 	return key, tensor, mismatch
 
 
@@ -133,7 +147,7 @@ class CheckpointManager:
 	def __init__(
 		self,
 		checkpoint_dir: tp.Union[str, os.PathLike],
-		enable: bool = True,
+		enable: tp.Optional[bool] = None,
 		float_dtype: jnp.dtype = jnp.bfloat16,
 		save_optimizer_state: bool = True,
 		verbose: bool = False,
@@ -151,6 +165,7 @@ class CheckpointManager:
 		verbose: bool = False,
 		mismatch_allowed: bool = True,
 		callback: tp.Optional[tp.Callable[[jax.Array, str], jax.Array]] = None,
+		dtype: tp.Optional[tp.Union[str, jnp.dtype]] = None,
 	) -> tp.Tuple[tp.Union[PyTreeNode, dict], dict]:
 		"""
 		Load a checkpoint from the given path.
@@ -178,6 +193,7 @@ class CheckpointManager:
 				mismatch_allowed=mismatch_allowed,
 				manager=f,
 				callback=callback,
+				dtype=dtype,
 			)
 			results = [
 				process_func(key)
@@ -202,12 +218,13 @@ class CheckpointManager:
 	def save_checkpoint(
 		state: PyTreeNode,
 		path: tp.Union[str, os.PathLike],
-		gather_fns: tp.Optional[dict[tp.Callable]] = None,
+		gather_fns: tp.Optional[tp.Union[dict[tp.Callable], bool]] = None,
 		float_dtype: tp.Optional[tp.Union[str, jnp.dtype]] = None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		metadata: tp.Optional[dict[str, str]] = None,
-	):
+		enable: tp.Optional[bool] = None,
+	) -> tp.Union[str, os.PathLike]:
 		"""
 		Save a checkpoint to the given path using SafeTensors.
 
@@ -219,7 +236,14 @@ class CheckpointManager:
 			verbose: Whether to print verbose output.
 			mismatch_allowed: Whether to allow mismatches between the state dictionary and gather functions.
 			metadata: Additional metadata to store in the checkpoint.
+			enable: whenever checkpointer is enable to save file or not.
+		Returns:
+			path where data is saved to.
 		"""
+		if enable is None:
+			enable = jax.process_index() == 0
+		if not enable:
+			path = "/dev/null"
 		state = to_state_dict(state)
 		gather_mismatch_count = 0
 
@@ -227,36 +251,34 @@ class CheckpointManager:
 			state = flatten_dict(state, sep=".")
 
 		if gather_fns:
-			if not is_flatten(gather_fns):
-				gather_fns = flatten_dict(gather_fns)
-
 			pbar_gather = tqdm(
 				list(state.keys()),
 				desc="Gathering State",
 				disable=not verbose,
 			)
-			for key in pbar_gather:
-				try:
-					callable_func = gather_fns.get(key)
+			if isinstance(gather_fns, bool):
+				for key in pbar_gather:
+					pbar_gather.update(1)
+					state[key] = jax.device_get(state[key])
+			else:
+				if not is_flatten(gather_fns):
+					gather_fns = flatten_dict(gather_fns, sep=".")
+
+				for key in pbar_gather:
+					callable_func = gather_fns.get(key, None)
 					if callable_func is None:
 						if not mismatch_allowed:
-							raise KeyError(
-								f"Gather Function {key} is None and NoneType OBJ is not callable."
-							)
+							raise KeyError(f"Gather Function {key} missing.")
 						gather_mismatch_count += 1
 					else:
 						state[key] = callable_func(state[key])
 
-				except KeyError as e:
-					if not mismatch_allowed:
-						raise KeyError(e) from None
-					gather_mismatch_count += 1
-				pbar_gather.set_postfix(gather_mismatch=gather_mismatch_count)
-				pbar_gather.update(1)
+					pbar_gather.set_postfix(gather_mismatch=gather_mismatch_count)
+					pbar_gather.update(1)
 
 		state = {
-			key: get_dtype(
-				jnp.array(value) if not isinstance(value, jax.Array) else value,
+			key: put_dtype(
+				jax.device_get(jnp.array(value)) if not isinstance(value, jax.Array) else value,
 				float_dtype,
 			)
 			for key, value in state.items()
@@ -264,6 +286,7 @@ class CheckpointManager:
 		}
 
 		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)
+		return path
 
 	@staticmethod
 	def save_state_to_file(
@@ -317,7 +340,7 @@ class CheckpointManager:
 							raise KeyError(k_err) from None
 						gather_mismatch_count += 1
 				pbar.set_postfix(gather_mismatch=gather_mismatch_count)
-				value = get_dtype(value, float_dtype)
+				value = put_dtype(value, float_dtype)
 				stream.write(packer.pack((key, to_bytes(value))))
 
 	def save_pickle(self, obj: object, filename: tp.Union[str, os.PathLike]):

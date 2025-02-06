@@ -7,9 +7,7 @@ dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
 import logging
-from functools import partial
 
-import fjformer
 import flax
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
@@ -22,48 +20,37 @@ logging.basicConfig(
 )
 
 # Constants
-TOTAL_BATCH_SIZE = 4
+TOTAL_BATCH_SIZE = 2
 UPPER = 600
-NUM_TRAIN_EPOCHS = 2
+NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
 SAVE_STEPS = 10
-DO_LAST_SAVE = False
+DO_LAST_SAVE = True
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 MAX_TRAINING_STEPS = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 MAX_EVALUATION_STEPS = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
-PURNING_MODULE = (
-	fjformer.jaxpruner.MagnitudePruning(
-		sparsity_distribution_fn=partial(
-			fjformer.jaxpruner.sparsity_distributions.uniform,
-			sparsity=0.8,
-		),
-		scheduler=fjformer.jaxpruner.sparsity_schedules.OneShotSchedule(0),
-	)
-	if False
-	else None
-)  # Not Supported Yet in new version
 
 
 def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 	"""Creates the model."""
 	logging.info("Creating model...")
-	config = ed.LlamaConfig(
-		head_dim=16,
+	config = ed.Xerxes2Config(
+		vocab_size=32000,
 		hidden_size=64,
 		num_attention_heads=8,
-		num_key_value_heads=4,
-		num_hidden_layers=1,
+		num_hidden_layers=4,
 		intermediate_size=128,
 		max_position_embeddings=sequence_length,
-		attn_dtype=dtype,
+		attn_dtype=jnp.float32,
+		attn_softmax_dtype=jnp.float32,
 		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 	)
 
-	model = ed.LlamaForCausalLM(
+	model = ed.Xerxes2ForCausalLM(
 		config=config,
 		dtype=dtype,
 		param_dtype=dtype,
@@ -137,7 +124,6 @@ def create_training_args(
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,
 		warmup_steps=warmup_steps,
-		pruning_module=PURNING_MODULE,
 	)
 	logging.info("Training arguments created.")
 	return training_args
@@ -146,12 +132,10 @@ def create_training_args(
 def main(use_iterable_dataset: bool = True):
 	model = create_model()
 	train_dataset = create_dummy_dataset(
-		NUM_TRAIN_EXAMPLES,
-		use_iterable_dataset=use_iterable_dataset,
+		NUM_TRAIN_EXAMPLES, use_iterable_dataset=use_iterable_dataset
 	)
 	eval_dataset = create_dummy_dataset(
-		NUM_EVAL_EXAMPLES,
-		use_iterable_dataset=use_iterable_dataset,
+		NUM_EVAL_EXAMPLES, use_iterable_dataset=use_iterable_dataset
 	)
 	training_args = create_training_args()
 

@@ -16,10 +16,10 @@
 import gc
 import threading
 import time
-from dataclasses import dataclass
 
 import jax
 import psutil
+from chex import dataclass
 
 try:
 	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
@@ -115,16 +115,14 @@ class vInferenceMetrics:
 		)
 
 		# Start monitoring threads
-		try:
+		if jax.device_count() == jax.local_device_count():
 			self._start_memory_monitoring()  # Fixes 181 (currently)
-		except Exception:
-			...
 
 	def _start_memory_monitoring(self):
 		def monitor_memory():
 			while True:
 				# JAX memory monitoring
-				for device in jax.devices():
+				for device in jax.local_devices():
 					memory_stats = device.memory_stats()
 					if memory_stats:  # Some devices might not support memory stats
 						self.jax_memory_used.labels(
