@@ -1,4 +1,5 @@
 
+# python3.10 do_inference.py
 import easydel as ed
 from easydel.utils.analyze_memory import SMPMemoryMonitor  # Optional for memory analysis
 import jax
