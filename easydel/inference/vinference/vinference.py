@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Module for text generation pipeline using JAX/Flax."""
 
 import asyncio
+import contextlib
 import os
 import pathlib
 import pickle
@@ -29,12 +29,14 @@ from uuid import uuid4
 import jax
 import numpy as np
 from chex import PRNGKey
-from fjformer import GenerateRNG
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jax._src.stages import Compiled
+from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
+
 
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
@@ -48,13 +50,12 @@ from ..utils import (
 	vInferenceConfig,
 )
 from ._fn import (
-	causal_lm_first_iter_fn,
-	causal_lm_iter_fn,
+	basic_generation_first_iter_fn,
+	basic_generation_iter_fn,
 	get_compiled_funcs,
 	measure_flops,
 	put_compiled_funcs,
 )
-from .metrics import vInferenceMetrics
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
@@ -65,6 +66,22 @@ else:
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
+
+
+def extract_shardings(tree, mesh=None):
+	if mesh is None:
+		mesh = pxla.thread_resources.env.physical_mesh
+
+	def cond(x):
+		sharding = x.sharding if hasattr(x, "sharding") else None
+		if isinstance(sharding, jax.sharding.PartitionSpec):
+			assert mesh is not None, "Mesh Can not be none (use function under with `mesh`)."
+			sharding = jax.sharding.NamedSharding(mesh=mesh, spec=sharding)
+		if not isinstance(sharding, jax.sharding.NamedSharding):
+			return None
+		return sharding
+
+	return jax.tree_util.tree_map(cond, tree)
 
 
 class vInferenceMetaData(BaseModel):
@@ -96,37 +113,100 @@ class vInference:
 		inference_name: tp.Optional[str] = None,
 	):
 		"""
-		Initializes the vInference class.
-
-		Args:
-			model: The pre-trained language model.
-			processor_class: The processor_class for the model.
-			generation_config: The generation configuration.
-			seed: The random seed for generation.
-			input_partition_spec: The partitioning specification for input data.
-			max_new_tokens: The maximum number of new tokens to generate.
+		Arguments:
+		  model: The pre-trained language model.
+		  processor_class: The processor_class for the model.
+		  generation_config: The generation configuration.
+		  seed: The random seed for generation.
+		  input_partition_spec: The partitioning specification for input data.
+		  max_new_tokens: The maximum number of new tokens to generate.
 		"""
-		# fmt:off
+		from easydel.utils import GenerateRNG
+
 		graphdef, graphstate = nn.split(model)
-		self.graphdef = graphdef 
+		self.graphdef = graphdef
 		self.graphstate = graphstate
-		self.model=model 
+		self.model = model
 		self.processor_class = processor_class
-		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
+		self.generation_config = self._init_generation_config(
+			generation_config, max_new_tokens
+		)
 		if seed is None:
 			seed = random.randint(0, int(1e6))
-		self._rng_generator = GenerateRNG(seed)
-		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
+		self.input_partition_spec = input_partition_spec or PartitionSpec(
+			("dp", "fsdp"), "sp"
+		)
 		self.mesh = self.model.config.mesh
+		self._rng_generator = GenerateRNG(seed)
 		self._precompile_lock = asyncio.Lock()
 		self._precompiled_configs = set()
 		self._in_compiling_process = set()
 		self._init_variables()
 		self._validate_token_ids()
-		self._uuid4 = uuid4().hex 
+		self._uuid4 = uuid4().hex
 		self._inference_name = inference_name or self._generate_inference_name(model)
-		self.metrics = vInferenceMetrics(self._inference_name)
-		# fmt:on
+		erm = os.environ.get("EASYDEL_RECORDS_METRICS", "true").lower() in [
+			"true",
+			"yes",
+			"1",
+			"on",
+		]
+		self._report_metrics = erm and jax.process_count() == 1
+		if not self._report_metrics:
+			logger.info("vInference-metrics is disabled")
+			logger.debug(f"vInference-metrics is disabled [status erm={erm}]")
+
+	@cached_property
+	def metrics(self):
+		if self._report_metrics:
+			from .metrics import vInferenceMetrics
+
+			return vInferenceMetrics(self._inference_name)
+		return None
+
+	def _metrics_increase_queue(self):
+		if self._report_metrics:
+			self.metrics.queue_size.labels(model_name=self.metrics.model_name).inc()
+
+	def _metrics_decrease_queue(self):
+		if self._report_metrics:
+			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
+
+	def _inference_latency_context_manager(self, stage):
+		if self._report_metrics:
+			return self.metrics.inference_latency.labels(
+				model_name=self.metrics.model_name,
+				stage=stage,
+			).time()
+		return contextlib.nullcontext()
+
+	def _post_generation_metrics_update(self, state):
+		if self._report_metrics:
+			self.metrics.token_throughput.labels(
+				model_name=self.metrics.model_name,
+				operation="output",
+			).inc(state.generated_tokens)
+			self.metrics.generation_length.labels(
+				model_name=self.metrics.model_name,
+			).observe(state.generated_tokens)
+			self.metrics.inference_requests.labels(
+				model_name=self.metrics.model_name,
+				status="success",
+			).inc()
+
+	def _submit_during_generation_metrics_update(self):
+		if self._report_metrics:
+			self.metrics.inference_requests.labels(
+				model_name=self.metrics.model_name, status="error"
+			).inc()
+
+	def _compilation_metrics_recorder(self):
+		if self._report_metrics:
+			return self.metrics.compilation_time.labels(
+				model_name=self.metrics.model_name,
+				function_name="_compile_and_lower_funs",
+			).time()
+		return contextlib.nullcontext()
 
 	@cached_property
 	def tokenizer(self):
@@ -134,7 +214,6 @@ class vInference:
 
 		if isinstance(self.processor_class, PreTrainedTokenizerBase):
 			return self.processor_class
-
 		from transformers import ProcessorMixin
 
 		if isinstance(self.processor_class, ProcessorMixin):
@@ -190,10 +269,10 @@ class vInference:
 		the maximum new tokens from the model's maximum sequence length.
 
 		Returns:
-				int: The maximum length available for input prefill
+		    int: The maximum length available for input prefill
 
 		Raises:
-				ValueError: If no maximum sequence length configuration is found
+		    ValueError: If no maximum sequence length configuration is found
 		"""
 		possible_length_attributes = [
 			"granted_mask_max_position_embedding",
@@ -216,10 +295,10 @@ class vInference:
 		Find the first available maximum length configuration from a list of possible attributes.
 
 		Args:
-				attributes: tp.List of attribute names to check in order of preference
+		    attributes: tp.List of attribute names to check in order of preference
 
 		Returns:
-				tp.Optional[int]: The maximum length if found, None otherwise
+		    tp.Optional[int]: The maximum length if found, None otherwise
 		"""
 		for attr in attributes:
 			max_length = getattr(self.model.config, attr, None)
@@ -228,17 +307,19 @@ class vInference:
 		return None
 
 	def _init_generation_config(
-		self, generation_config: tp.Optional[vInferenceConfig], max_new_tokens: int
+		self,
+		generation_config: tp.Optional[vInferenceConfig],
+		max_new_tokens: int,
 	) -> vInferenceConfig:
 		"""
 		Initializes the generation configuration.
 
 		Args:
-			generation_config: The generation configuration.
-			max_new_tokens: The maximum number of new tokens to generate.
+		  generation_config: The generation configuration.
+		  max_new_tokens: The maximum number of new tokens to generate.
 
 		Returns:
-			vInferenceConfig: The initialized generation configuration.
+		  vInferenceConfig: The initialized generation configuration.
 		"""
 		if generation_config is None:
 			if self.model.generation_config is not None:
@@ -266,7 +347,7 @@ class vInference:
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
-		self.gen_input_sharding = NamedSharding(
+		self.generation_input_shape = NamedSharding(
 			spec=PartitionSpec(self.input_partition_spec[0], None),
 			mesh=self.model.mesh,
 		)
@@ -278,8 +359,6 @@ class vInference:
 		rng: tp.Optional[PRNGKey] = None,
 		**model_kwargs,
 	):
-		if rng is None:
-			rng = self._rng_generator.rng
 		pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
 		batch_size, current_length = input_ids.shape
 		max_length = current_length + self.generation_config.max_new_tokens
@@ -330,114 +409,184 @@ class vInference:
 		**model_kwargs,
 	) -> tp.Union[tp.Generator[SampleState, tp.Any, tp.Any], SampleState]:
 		"""
-		Generates text in streaming chunks.
-
-		This function takes the input IDs, attention mask, and position IDs as input,
-		precompiles the generation functions if necessary, and yields the generated text
-		in streaming chunks.
+		Generates text in streaming chunks with improved performance monitoring and error handling.
 
 		Args:
-			input_ids: The input token IDs.
-			attention_mask: The attention mask.
+		    input_ids: Input token IDs as a JAX array
+		    attention_mask: Optional attention mask for the input
+		    **model_kwargs: Additional model-specific keyword arguments
 
-		Yields:
-			SampleState: The generated text in streaming chunks.
+		Returns:
+		    Generator yielding SampleState objects containing generation results and metrics
+
+		Raises:
+		    ValueError: If input dimensions are invalid
+		    RuntimeError: If generation fails
 		"""
-		self.metrics.queue_size.labels(model_name=self.metrics.model_name).inc()
+		self._metrics_increase_queue()
 
 		try:
-			with self.metrics.inference_latency.labels(
-				model_name=self.metrics.model_name,
-				stage="preprocessing",
-			).time():
-				input_ids = jnp.array(input_ids, dtype="i4", device=self.input_sharding)
-				batch_size, sequence_length = input_ids.shape
+			# Input validation and preprocessing
+			if not isinstance(input_ids, jax.Array):
+				input_ids = jnp.array(input_ids, dtype=jnp.int32)
+
+			batch_size, sequence_length = input_ids.shape
+			self.precompile(batch_size=batch_size, input_tokens_length=sequence_length)
+			if batch_size <= 0 or sequence_length <= 0:
+				raise ValueError(f"Invalid input dimensions: {input_ids.shape}")
+
+			# Prepare generation context
+			with self._inference_latency_context_manager("preprocessing"):
+				state = self._prepare_generation_state(
+					input_ids=input_ids,
+					attention_mask=attention_mask,
+					batch_size=batch_size,
+					sequence_length=sequence_length,
+					model_kwargs=model_kwargs,
+				)
 
 				generate_func, interval_func = get_compiled_funcs(
 					batch_size=batch_size,
 					input_tokens_length=sequence_length,
 					id=self._uuid4,
 				)
-				if attention_mask is None:
-					warnings.warn(
-						"`attention_mask` is not provided, it's recommended to "
-						"pass an attention mask for better results.",
-						stacklevel=1,
-					)
-					attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 
-				attention_mask = jnp.array(
-					attention_mask,
-					dtype="i4",
-					device=self.input_sharding,
-				)
+			# Main generation loop
+			with self._inference_latency_context_manager("inference"):
+				state = yield from self._inner_generate(state, generate_func, interval_func)
 
-				model_kwargs.update(dict(input_ids=input_ids, attention_mask=attention_mask))
+			self._post_generation_metrics_update(state)
+			return state
 
-				state = self._init_state(**model_kwargs)
-			with self.metrics.inference_latency.labels(
-				model_name=self.metrics.model_name,
-				stage="inference",
-			).time():
-				(
-					state,
-					flop,
-					generate_func_flops,
-					generate_func_elapsed_time,
-				) = measure_flops(
-					generate_func,
-					graphstate=self.graphstate,
-					state=state,
-				)
-				interval_time = 0
-				state.generate_func_flops = generate_func_flops
-				if not state.is_sequence_finished:
-					all_interval_func_flops = []
-					for _ in range(self.generation_config._loop_rows):
-						(
-							state,
-							flop,
-							interval_func_flops,
-							interval_func_elapsed_time,
-						) = measure_flops(
-							interval_func,
-							graphstate=self.graphstate,
-							state=state,
-							loop_max_tokens=self.generation_config.streaming_chunks,
-						)
-						interval_time += interval_func_elapsed_time
-
-						all_interval_func_flops.append(interval_func_flops)
-						interval_func_flops = np.mean(all_interval_func_flops)
-						state.generate_func_flops = generate_func_flops
-						state.interval_func_flops = interval_func_flops
-						
-						state.tokens_pre_second = state.generated_tokens / interval_time
-						yield state
-						if state.is_sequence_finished:
-							break
-				else:
-					yield state
-
-			self.metrics.token_throughput.labels(
-				model_name=self.metrics.model_name,
-				operation="output",
-			).inc(state.generated_tokens)
-			self.metrics.generation_length.labels(
-				model_name=self.metrics.model_name,
-			).observe(state.generated_tokens)
-			self.metrics.inference_requests.labels(
-				model_name=self.metrics.model_name,
-				status="success",
-			).inc()
 		except Exception as e:
-			self.metrics.inference_requests.labels(
-				model_name=self.metrics.model_name,
-				status="error",
-			).inc()
-			raise e
+			self._handle_generation_error(e)
+
 		finally:
-			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
+			self._metrics_decrease_queue()
+
+	def _prepare_generation_state(
+		self,
+		input_ids: jax.Array,
+		attention_mask: tp.Optional[jax.Array],
+		batch_size: int,
+		sequence_length: int,
+		model_kwargs: dict,
+	) -> SampleState:
+		"""Prepares the initial state for text generation."""
+		if attention_mask is None:
+			warnings.warn(
+				"No attention mask provided. Using default mask.",
+				UserWarning,
+				stacklevel=2,
+			)
+			attention_mask = jnp.ones(
+				(batch_size, sequence_length),
+				dtype=jnp.int32,
+			)
+
+		attention_mask = jnp.asarray(attention_mask, dtype="i4", device=self.input_sharding)
+		input_ids = jnp.asarray(input_ids, dtype="i4", device=self.input_sharding)
+		model_kwargs.update({"input_ids": input_ids, "attention_mask": attention_mask})
+		if model_kwargs.get("rng") is None:
+			rng = self._rng_generator.rng
+			model_kwargs["rng"] = rng
+		return self._init_state(**model_kwargs)
+
+	def _inner_generate(
+		self,
+		state: SampleState,
+		generate_func: callable,
+		interval_func: callable,
+	) -> tp.Generator[SampleState, tp.Any, tp.Any]:
+		"""Core generation loop with performance monitoring."""
+
+		# Initial generation step
+		state = self._execute_generation_step(generate_func, state)
+		all_interval_func_flops = []
+		if not state.is_sequence_finished.all():
+			# Subsequent generation steps
+			interval_time = 0
+			for _ in range(self.generation_config._loop_rows):
+				state, interval_time = self._execute_interval_step(
+					interval_func,
+					state,
+					interval_time,
+					all_interval_func_flops,
+				)
+				yield state
+				if state.is_sequence_finished.all():
+					break
+		return state
+
+	def _prepare_function_inputs(
+		self,
+		state,
+		func,
+	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		if isinstance(func, Compiled):
+			return (
+				self.graphstate,
+				state,
+			)
+
+		return (
+			self.graphdef,
+			self.graphstate,
+			state,
+			self.generation_config,
+		)
+
+	def _prepare_iter_function_inputs(
+		self,
+		state,
+		interval_func,
+	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		if isinstance(interval_func, Compiled):
+			return (
+				self.graphstate,
+				state,
+				self.generation_config.streaming_chunks,
+			)
+
+		return (
+			self.graphdef,
+			self.graphstate,
+			state,
+			self.generation_config,
+			self.generation_config.streaming_chunks,
+		)
+
+	def _execute_generation_step(self, func: callable, state: SampleState) -> SampleState:
+		"""Executes a single generation step with performance monitoring."""
+		inputs = self._prepare_function_inputs(state, func)
+		state, _, generate_func_flops, __ = measure_flops(func, *inputs)
+		state.generate_func_flops = generate_func_flops
+		return state
+
+	def _execute_interval_step(
+		self,
+		interval_func,
+		state,
+		interval_time,
+		all_interval_func_flops,
+	):
+		inputs = self._prepare_iter_function_inputs(state, interval_func)
+		state, _, interval_func_flops, elapsed_time = measure_flops(interval_func, *inputs)
+		interval_time += elapsed_time
+		all_interval_func_flops.append(interval_func_flops)
+		interval_func_flops = np.mean(all_interval_func_flops)
+		state.interval_func_flops = interval_func_flops
+		state.tokens_pre_second = state.generated_tokens / interval_time
+		return (state, interval_time)
+
+	def _handle_generation_error(self, error: Exception):
+		"""Handles errors during generation with appropriate logging and cleanup."""
+		self._submit_during_generation_metrics_update()
+
+		if isinstance(error, ValueError):
+			raise ValueError(f"Invalid input configuration: {str(error)}") from error
+
+		raise RuntimeError(f"Generation failed: {str(error)}") from error
 
 	def _get_compile_model_kwargs(self, batch_size, input_tokens_length):
 		return dict(
@@ -451,6 +600,7 @@ class vInference:
 				dtype="i4",
 				device=self.input_sharding,
 			),
+			rng=self._rng_generator.rng,
 		)
 
 	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
@@ -462,36 +612,62 @@ class vInference:
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
-			state = self._init_state(
-				**self._get_compile_model_kwargs(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
+			logger.debug("initiating state for lowering and compiling func.")
+			wargs = self._get_compile_model_kwargs(
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
 			)
+
+			state = self._init_state(**wargs)
+			logger.debug("smart compiling `first_iter_fn`")
+			logger.debug("lowering `first_iter_fn`")
+			first_iter_fn_lowered = jax.jit(
+				basic_generation_first_iter_fn,
+				static_argnums=(0, 3),
+				in_shardings=(
+					extract_shardings(self.graphstate),
+					extract_shardings(state),
+				),
+			).lower(
+				self.graphdef,
+				self.graphstate,
+				state,
+				self.generation_config,
+			)
+			logger.debug("`first_iter_fn` lowered successfully.")
 			compiled_generate_func = smart_compile(
-				causal_lm_first_iter_fn.lower(
-					graphdef=self.graphdef,
-					graphstate=self.graphstate,
-					state=state,
-					generation_config=self.generation_config,
-				),
-				tag="vinference",
+				first_iter_fn_lowered,
+				tag="vinference.basic_generation_first_iter_fn",
 			)
-			compiled_interval_func = smart_compile(
-				causal_lm_iter_fn.lower(
-					graphdef=self.graphdef,
-					graphstate=self.graphstate,
-					state=compiled_generate_func(
-						graphstate=self.graphstate,
-						state=state,
-					),
-					generation_config=self.generation_config,
-					loop_max_tokens=self.generation_config.streaming_chunks,
+			logger.debug("smart compiling `iter_fn`")
+			logger.debug("lowering `iter_fn`")
+			sample_state = compiled_generate_func(self.graphstate, state)
+			sample_state_shardings = extract_shardings(sample_state)
+			
+			iter_fn_lowered = jax.jit(
+				basic_generation_iter_fn,
+				static_argnums=(0, 3),
+				in_shardings=(
+					extract_shardings(self.graphstate),
+					sample_state_shardings,
+					None,
 				),
-				tag="vinference",
+				out_shardings=sample_state_shardings,
+			).lower(
+				self.graphdef,
+				self.graphstate,
+				sample_state,
+				self.generation_config,
+				self.generation_config.streaming_chunks,
+			) 
+			logger.debug("`iter_fn` lowered successfully.")
+			compiled_interval_func = smart_compile(
+				iter_fn_lowered,
+				tag="vinference.basic_generation_iter_fn",
 			)
 
 			del state
+			logger.debug("saving compiled functions...")
 			put_compiled_funcs(
 				compiled_generate_func=compiled_generate_func,
 				compiled_interval_func=compiled_interval_func,
@@ -513,39 +689,45 @@ class vInference:
 		in a cache.
 
 		Args:
-			batch_size: The batch size.
-			input_tokens_length: The length of the input tokens.
+		  batch_size: The batch size.
+		  input_tokens_length: The length of the input tokens.
 
 		Returns:
-			bool: True if precompilation was successful, False otherwise.
+		  bool: True if precompilation was successful, False otherwise.
 		"""
 		if input_tokens_length is None:
 			input_tokens_length = self.model_prefill_length
+			logger.debug(
+				"`input_tokens_length` is None using `vInference.model_prefill_length`"
+			)
 		config_key = (batch_size, input_tokens_length)
 
 		if config_key in self._precompiled_configs:
 			return True
 		if config_key in self._in_compiling_process:
+			logger.debug(
+				f"lowering and compiling with `config` {config_key} have already been requested adding 5 second timeout"
+			)
 			time.sleep(5)
 			return self.precompile(
 				batch_size=batch_size,
 				input_tokens_length=input_tokens_length,
 			)
 		else:
-			with self.metrics.compilation_time.labels(
-				model_name=self.metrics.model_name,
-				function_name="_compile_and_lower_funs",
-			).time():
+			with self._compilation_metrics_recorder():
+				logger.debug(f"lowering and compiling with `config` {config_key}")
 				self._in_compiling_process.add(config_key)
-				self._compile_and_lower_funs(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
+				with self.mesh:
+					self._compile_and_lower_funs(
+						batch_size=batch_size,
+						input_tokens_length=input_tokens_length,
+					)
 				self._precompiled_configs.add(config_key)
 		return True
 
 	@tp.overload
 	def count_tokens(self, messages: tp.List[tp.Dict[str, str]]): ...
+
 	@tp.overload
 	def count_tokens(self, text: str): ...
 

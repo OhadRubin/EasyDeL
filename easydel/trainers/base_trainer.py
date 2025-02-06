@@ -19,6 +19,7 @@ import shutil
 import time
 import typing as tp
 from abc import abstractmethod
+from functools import cached_property
 from glob import glob
 from pathlib import Path
 
@@ -26,6 +27,7 @@ import flax
 import flax.core
 import flax.nnx
 import jax
+import jax.extend
 import numpy as np
 import termcolor
 import tqdm
@@ -37,6 +39,7 @@ import easydel
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.utils import CompilationTracker
 from easydel.utils.traversals import specs_to_name_sharding
 
 try:
@@ -53,13 +56,18 @@ from easydel.utils import Timers
 from easydel.utils.helpers import get_logger
 
 from .trainer_protocol import (
+	BaseProgressBar,
 	BaseTrainerProtocol,
+	JSONProgressBar,
+	NullProgressBar,
+	RichProgressBar,
+	TqdmProgressBar,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
 	TrainerOutput,
 )
-from .training_configurations import TrainingArguments
+from .training_configurations import MetricsType, TrainingArguments
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -78,6 +86,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		model: tp.type[EasyDeLBaseModule] = None,
 		dataset_train: tp.Optional[Dataset] = None,
 		dataset_eval: tp.Optional[Dataset] = None,
+		data_collator: tp.Optional[tp.Callable] = None,
 		finetune: bool = True,
 		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		**deprecated_kwargs,
@@ -95,6 +104,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
 		self.dataset_train = dataset_train
 		self.dataset_eval = dataset_eval
+		self.data_collator = data_collator
 		self.finetune = finetune
 		self.checkpoint_path = checkpoint_path
 		self._initialize_attributes()
@@ -108,8 +118,20 @@ class BaseTrainer(BaseTrainerProtocol):
 		return self._model
 
 	@property
+	def mesh(self):
+		return self.model.mesh
+
+	@mesh.setter
+	def mesh(self, val):
+		return val
+
+	@property
 	def training_batch_size(self):
 		return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
+
+	@cached_property
+	def is_process_zero(self):
+		return self.arguments.is_process_zero
 
 	@property
 	def evaluation_batch_size(self):
@@ -127,7 +149,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.scheduler = getattr(self, "scheduler", None)
 		self.tx = getattr(self, "tx", None)
 
-		self.mesh = getattr(self, "mesh", None)
 		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)  #
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 		self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
@@ -152,6 +173,9 @@ class BaseTrainer(BaseTrainerProtocol):
 			None,
 		)
 
+		self.train_tracker = getattr(self, "train_tracker", CompilationTracker())
+		self.evalu_tracker = getattr(self, "evalu_tracker", CompilationTracker())
+
 	def _initialize_memory_tracking(self):
 		if not self.arguments.performance_mode:
 			self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(1)
@@ -164,16 +188,42 @@ class BaseTrainer(BaseTrainerProtocol):
 	@staticmethod
 	def finish():
 		if wandb is not None:
-			wandb.finish()
+			try:
+				wandb.finish()
+			except Exception:
+				...
 
-	def get_runstage_flops(self, is_training):
+	def on_step_start(
+		self,
+		state: EasyDeLState,
+		step: int,
+	) -> EasyDeLState:
+		"""hook process to call in start of the step."""
+		return state
+
+	def on_step_end(
+		self,
+		state: EasyDeLState,
+		metrics: MetricsType,
+		step: int,
+	) -> tp.Tuple[EasyDeLState, MetricsType]:
+		"""hook process to call in start of the step."""
+		return state, metrics
+
+	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:
-			if is_training:
-				flops = self.sharded_training_step_function.cost_analysis()[0]["flops"]
-			else:
-				flops = self.sharded_evaluation_step_function.cost_analysis()[0]["flops"]
+			function = (
+				self.sharded_training_step_function
+				if is_training
+				else self.sharded_evaluation_step_function
+			)
+			flops = function.cost_analysis()[0]["flops"]
 		except Exception:
-			flops = 1
+			flops = (
+				self.train_tracker.cached_flops
+				if is_training
+				else self.evalu_tracker.cached_flops
+			)
 		return flops
 
 	def _ensure_functions_compiled(self):
@@ -256,7 +306,7 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _configure_state(self):
 		"""Configures and JIT-compiles the sharded state"""
 		with self.timer("configure sharded state"):
-			from easydel.escale import match_partition_rules
+			from eformer.escale import match_partition_rules
 
 			with self.model.mesh:
 				self.model_state = self.model_state.init_tx(self.tx)
@@ -282,12 +332,12 @@ class BaseTrainer(BaseTrainerProtocol):
 		based on the chosen `truncation_mode`.
 
 		Args:
-				max_sequence_length (int): The maximum allowed sequence length.
-				truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
-						The truncation mode. Defaults to "keep_end".
+		    max_sequence_length (int): The maximum allowed sequence length.
+		    truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
+		        The truncation mode. Defaults to "keep_end".
 
 		Returns:
-				tp.Callable: A function that takes a batch of data and returns a processed batch.
+		    tp.Callable: A function that takes a batch of data and returns a processed batch.
 		"""
 		raise NotImplementedError
 
@@ -297,12 +347,12 @@ class BaseTrainer(BaseTrainerProtocol):
 		Configures and JIT-compiles the training and evaluation step functions.
 
 		This method sets up the necessary functions for training and evaluation, including:
-				- Initialization of the model state.
-				- Sharding of the model parameters and optimizer state.
-				- JIT-compilation of the training and evaluation step functions.
+		    - Initialization of the model state.
+		    - Sharding of the model parameters and optimizer state.
+		    - JIT-compilation of the training and evaluation step functions.
 
 		Returns:
-				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		raise NotImplementedError
 
@@ -315,8 +365,8 @@ class BaseTrainer(BaseTrainerProtocol):
 		and evaluation steps based on the dataset sizes and training arguments.
 
 		Returns:
-				TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-																				maximum number of training and evaluation steps.
+		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
+		                                    maximum number of training and evaluation steps.
 		"""
 
 		def create_tf_dataset(
@@ -327,11 +377,11 @@ class BaseTrainer(BaseTrainerProtocol):
 			Creates a TensorFlow dataset from a Hugging Face Dataset.
 
 			Args:
-					dataset (Dataset): The Hugging Face Dataset.
-					is_train (bool): Whether the dataset is for training.
+			    dataset (Dataset): The Hugging Face Dataset.
+			    is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+			    tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			try:
 				import tensorflow as tf
@@ -348,7 +398,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					),
 					batch_size=batch_size,
 					drop_remainder=True,
-					shuffle=is_train,
+					shuffle=is_train and self.arguments.shuffle_train_dataset,
 					num_workers=self.arguments.dataloader_num_workers,
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
@@ -364,11 +414,11 @@ class BaseTrainer(BaseTrainerProtocol):
 			Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
 			Args:
-					dataset (IterableDataset): The iterable Hugging Face Dataset.
-					is_train (bool): Whether the dataset is for training.
+			    dataset (IterableDataset): The iterable Hugging Face Dataset.
+			    is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+			    tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			try:
 				import tensorflow as tf
@@ -377,14 +427,27 @@ class BaseTrainer(BaseTrainerProtocol):
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
 			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
+			tf_data_mapping = {
+				"float16": tf.float16,
+				"float32": tf.float32,
+				"float64": tf.float64,
+				"int16": tf.int16,
+				"int32": tf.int32,
+				"int64": tf.int64,
+				"bool": tf.bool,
+			}
 			return (
 				tf.data.Dataset.from_generator(
 					lambda: dataset,
 					output_signature={
 						col: tf.TensorSpec(
-							shape=(self.arguments.max_sequence_length,), dtype=tf.int32
+							shape=vals.shape[1:]
+							if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
+							else vals.shape,
+							dtype=tf_data_mapping[str(vals.dtype)],
 						)
-						for col in next(iter(dataset)).keys()
+						for col, vals in next(iter(dataset)).items()
+						if hasattr(vals, "shape")
 					},
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
@@ -401,14 +464,14 @@ class BaseTrainer(BaseTrainerProtocol):
 			Calculates the number of training or evaluation steps based on dataset length and arguments.
 
 			Args:
-				dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-				is_train (bool): Whether the dataset is for training.
+			  dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+			  is_train (bool): Whether the dataset is for training.
 
 			Returns:
-				int: The number of steps.
+			  int: The number of steps.
 
 			Raises:
-				ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
+			  ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
 			"""
 			if hasattr(dataset, "__len__"):
 				total_data_len = len(dataset)
@@ -448,11 +511,11 @@ class BaseTrainer(BaseTrainerProtocol):
 			Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
 			Args:
-					dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
-					is_train (bool): Whether the dataset is for training.
+			    dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+			    is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+			    tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
 			"""
 			if hasattr(dataset, "__len__"):
 				return create_tf_dataset(dataset, is_train)
@@ -485,7 +548,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		object containing the configured model, optimizer, scheduler, and configuration.
 
 		Returns:
-				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
+		    TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
 
 		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
@@ -501,18 +564,22 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
 		step = self._get_current_step(state)
 		self._manage_checkpoint_limit(self.arguments._get_save_directory())
+
 		directory_name = self.arguments._get_save_directory_milestone(
 			step=step,
 			create=True,
 		)
 
 		logger.info(f"saving state {directory_name}.")
-
+		enable = True
+		if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
+			enable = False
 		state.save_state(
 			save_directory=directory_name,
-			float_dtype=self.model.dtype,
+			float_dtype=self.model.param_dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
+			enable=enable,
 		)
 
 		self._save_readme(directory_name)
@@ -525,12 +592,19 @@ class BaseTrainer(BaseTrainerProtocol):
 		return step
 
 	def _manage_checkpoint_limit(self, save_directory):
-		if self.arguments.save_total_limit:
+		def _save():
 			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
 			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
 				shutil.rmtree(old_save_directory, ignore_errors=True)
 				logger.info(f"Removed old directory: {old_save_directory}")
+
+		if self.arguments.save_total_limit:
+			if self.arguments.process_zero_is_admin:
+				if self.is_process_zero:
+					_save()
+			else:
+				_save()
 
 	def _save_readme(self, save_directory):
 		with open(os.path.join(save_directory, "README.md"), "w") as f:
@@ -547,8 +621,10 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _get_device_info(self) -> dict:
 		"""Get information about available devices."""
 		try:
-			devices = jax.devices()
-			return {"platform": devices[0].platform.upper(), "device_count": len(devices)}
+			return {
+				"platform": jax.local_devices()[0].platform.upper(),
+				"device_count": jax.device_count(),
+			}
 		except Exception as e:
 			logger.error(f"Error getting device info: {str(e)}")
 			return {"platform": "UNKNOWN", "device_count": 0}
@@ -558,7 +634,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		Generate formatted information about the model and training setup.
 
 		Returns:
-				str: Formatted markdown string containing model and training information
+		    str: Formatted markdown string containing model and training information
 		"""
 		device_info = self._get_device_info()
 		partition_rules = self._format_partition_rules()
@@ -591,8 +667,8 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 ### Model Details
 - **Architecture**: {self.config.model_type}
-- **Platform**: {device_info['platform']}
-- **Number of Devices**: {device_info['device_count']}
+- **Platform**: {device_info["platform"]}
+- **Number of Devices**: {device_info["device_count"]}
 
 ### Training Parameters
 - **Learning Rate**: {self.arguments.learning_rate} → {self.arguments.learning_rate_end}
@@ -606,8 +682,8 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 - **Epochs**: {self.arguments.num_train_epochs}
 - **Batch Size**: {self.arguments.total_batch_size}
 - **Sequence Length**: {self.arguments.max_sequence_length} 
-- **Dtype**: {self.model.dtype}
-- **Params Dtype**: {self.model.param_dtype}
+- **Dtype**: {str(self.model.dtype)}
+- **Params Dtype**: {str(self.model.param_dtype)}
 
 ### Advanced Configuration
 - **Gradient Checkpointing**: {self.model.config.gradient_checkpointing}  
@@ -631,7 +707,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		Save the generated information to a markdown file.
 
 		Args:
-				output_path: Path where the markdown file should be saved
+		    output_path: Path where the markdown file should be saved
 		"""
 		try:
 			output_path = Path(output_path)
@@ -654,7 +730,6 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]
 		] = None,
 		to_torch: bool = False,
-		base_hf_auto_class=None,
 		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
 		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
@@ -662,49 +737,30 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			self.arguments.save_directory, self.arguments.model_name
 		)
 
-		if base_hf_auto_class is None:
-			from transformers import AutoModelForCausalLM as base_hf_auto_class
 		if to_torch:
 			return self._save_to_torch(
-				state,
-				save_directory,
-				base_hf_auto_class,
-				easystate_to_huggingface_model_kwargs,
-				torch_save_pretrained_kwargs,
+				state=state,
+				save_directory=save_directory,
+				easystate_to_huggingface_model_kwargs=easystate_to_huggingface_model_kwargs,
+				torch_save_pretrained_kwargs=torch_save_pretrained_kwargs,
 			)
 		else:
 			return self._save_state(
-				state=state, gather_fns=gather_fns, save_directory=save_directory
+				state=state,
+				gather_fns=gather_fns,
+				save_directory=save_directory,
 			)
 
 	def _save_to_torch(
 		self,
-		state,
-		save_directory,
-		base_hf_auto_class,
-		easystate_to_huggingface_model_kwargs,
-		torch_save_pretrained_kwargs,
+		state: EasyDeLState,
+		save_directory: tp.Union[str, os.PathLike],
+		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
+		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
-		from easydel.utils.parameters_transformation import (
-			easystate_to_huggingface_model,
-		)
-
 		easystate_to_huggingface_model_kwargs = easystate_to_huggingface_model_kwargs or {}
 		torch_save_pretrained_kwargs = torch_save_pretrained_kwargs or {}
-
-		model_config = state.module_config or state.module.config_class
-		model_type = model_config.model_type
-		model_class = base_hf_auto_class._model_mapping[type(model_config)]
-
-		hf_model_config = self._create_hf_model_config(state, model_config, model_type)
-
-		hf_model = easystate_to_huggingface_model(
-			state=state,
-			base_huggingface_module=model_class,
-			config=hf_model_config,
-			**easystate_to_huggingface_model_kwargs,
-		)
-
+		hf_model = state.model.to_torch(**easystate_to_huggingface_model_kwargs)
 		self._save_readme(save_directory)
 		hf_model.save_pretrained(save_directory, **torch_save_pretrained_kwargs)
 		return hf_model
@@ -763,12 +819,16 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return metrics
 
 	def start_training_hook(self):
-		self._ensure_functions_compiled()
+		self.get_runstage_flops(True)
+		self._setup_static_metrics()
 		self._training_time_start = time.time()
 
 	def start_evaluation_hook(self):
-		self._ensure_functions_compiled()
+		self.get_runstage_flops(False)
+		self._setup_static_metrics()
 		self._evaluation_time_start = time.time()
+
+	def _setup_static_metrics(self): ...
 
 	def compile_aot(self) -> bool:
 		compiled = False
@@ -811,7 +871,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return (
 			self.arguments.save_steps is not None
 			and current_step > 0
-			and (current_step % self.arguments.save_steps) == 0
+			and current_step % self.arguments.save_steps == 0
 		)
 
 	def _should_run_evaluation(self, current_step):
@@ -898,15 +958,20 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	def _setup_initial_metrics(self, state):
 		"""Setup initial metrics logging."""
 		# Calculate and log model size
+		model_size = self.count_model_parameters(state.graphstate)
 		self.arguments.log_metrics(
 			{
-				"Number of Model Parameters (Billion)": self.count_model_parameters(
-					state.graphstate
-				)
+				"Number of Model Parameters (Billion)": model_size,
+				"process_count": jax.process_count(),
+				"device_count": jax.device_count(),
+				"local_device_count": jax.local_device_count(),
+				"platform": jax.extend.backend.get_backend().platform,
+				"XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
+				"LIBTPU_INIT_ARGS": os.environ.get("LIBTPU_INIT_ARGS", ""),
 			},
 			step=0,
+			log_as="config",
 		)
-		self._flops_model_state = self.calculate_number_total_flops(params=state.graphstate)
 
 	def _get_next_batch(self, train_iter):
 		"""Get next batch from iterator, reinitializing if needed."""
@@ -922,28 +987,78 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 		return batch
 
-	def _log_metrics(
+	def create_progress_bar(
 		self,
-		metrics: tp.Dict[str, float],
-		pbar: tqdm.tqdm,
+		total: int,
+		desc: str = "",
+		disabled: bool = False,
+	) -> BaseProgressBar:
+		"""Create a progress bar of the specified type."""
+		if disabled:
+			return NullProgressBar()
+		rpr = self.arguments.progress_bar_type
+		if rpr == "tqdm":
+			return TqdmProgressBar(tqdm.tqdm(total=total, desc=desc, disable=disabled))
+		elif rpr == "rich":  # rich
+			from rich.progress import Progress
+
+			if hasattr(self, "_hidden_rich_pbar"):
+				progress = self._hidden_rich_pbar
+			else:
+				from rich.progress import (
+					BarColumn,
+					Progress,
+					SpinnerColumn,
+					TextColumn,
+					TimeRemainingColumn,
+				)
+
+				from .trainer_protocol import MetricsColumn
+
+				progress = Progress(
+					SpinnerColumn(),
+					TextColumn("[bold blue]{task.description}"),
+					BarColumn(bar_width=None),
+					TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+					TimeRemainingColumn(),
+					MetricsColumn(metrics_to_show=self.arguments.metrics_to_show_in_rich_pbar),
+					expand=True,
+					refresh_per_second=10,
+					disable=disabled,
+				)
+				progress.start()
+				self._hidden_rich_pbar = progress
+			task_id = progress.add_task(desc, total=total)
+			return RichProgressBar(progress, task_id)
+		elif rpr == "json":
+			return JSONProgressBar(desc=desc)
+		else:
+			raise NotImplementedError(f"Progress Bar type {rpr}'s not supported.")
+
+	def log_metrics(
+		self,
+		metrics: MetricsType,
+		pbar: BaseProgressBar,
 		step: int,
 		mode: str = "train",
 	):
 		"""Log metrics and update progress bar."""
-		# Update progress bar
-		if ((step + 1) % self.arguments.log_steps == 0) or (step == 0):
-			pbar.set_postfix(
-				**{
-					k.replace(
-						f"{mode}/",
-						"",
-					): v
-					for k, v in metrics.items()
-					if len(k) < 30
-				}
-			)
+
+		if step % self.arguments.log_steps == 0:
+			if step == 0:
+				pbar.reset()
+			display_metrics = {
+				k.replace("train/", "").replace("eval/", ""): v
+				for k, v in metrics.items()
+				if not (
+					k.startswith("mlperf/")
+					or k.startswith("train/grad_norm")
+					or k.startswith("eval/grad_norm")
+				)
+			}
+			# Update progress bar
+			pbar.set_postfix(**display_metrics)
 			update_size = 0 if step == 0 else self.arguments.log_steps
 			pbar.update(update_size)
-		# Log metrics if tracking is enabled
-		if not self.arguments.performance_mode:
+		if step % self.arguments.report_steps == 0:
 			self.arguments.log_metrics(metrics=metrics, step=step)

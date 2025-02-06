@@ -10,6 +10,19 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
+SCAN_TRAINER = os.environ.get("SCAN_TRAINER", "true").lower() in [
+	"true",
+	"1",
+	"on",
+	"yes",
+]
+FAST_COMPILE = os.environ.get("FAST_COMPILE", "true").lower() in [
+	"true",
+	"1",
+	"on",
+	"yes",
+]
+
 
 def make_assertions_and_get_sizes(
 	batch: tp.Dict,
@@ -91,30 +104,33 @@ def update_state_respectfully(
 	Returns:
 		EasyDeLState: The updated state of the model.
 	"""
-
-	def update_fn(args):
-		state, gradients = args
+	if FAST_COMPILE:
 		return state.apply_gradients(grads=gradients)
+	else:
 
-	def skip_fn(args):
-		state, _ = args
-		return state
+		def update_fn(args):
+			state, gradients = args
+			return state.apply_gradients(grads=gradients)
 
-	should_update = True
-	if loss_config is not None:
-		should_update = lax.cond(
-			loss_config.break_on_nan,
-			lambda x: lax.cond(
-				jnp.isnan(metrics.loss),
-				lambda _: False,
-				lambda _: True,
+		def skip_fn(args):
+			state, _ = args
+			return state
+
+		should_update = True
+		if loss_config is not None:
+			should_update = lax.cond(
+				loss_config.break_on_nan,
+				lambda x: lax.cond(
+					jnp.isnan(metrics.loss),
+					lambda _: False,
+					lambda _: True,
+					None,
+				),
+				lambda x: True,
 				None,
-			),
-			lambda x: True,
-			None,
-		)
-	state = lax.cond(should_update, update_fn, skip_fn, (state, gradients))
-	return state
+			)
+		state = lax.cond(should_update, update_fn, skip_fn, (state, gradients))
+		return state
 
 
 def minibatch_call(
@@ -124,57 +140,50 @@ def minibatch_call(
 	grad_fn: tp.Callable[[jax.Array, tp.Dict], tp.Tuple[jax.Array, LossMetrics]],
 ) -> tp.Tuple[jax.Array, LossMetrics]:
 	"""
-	Processes a batch of data in smaller minibatches and accumulates gradients and metrics.
-
-	Args:
-		state (EasyDeLState): The current state of the model.
-		batch (tp.Dict): The batch of data to be processed.
-		minibatch_size (int): The size of each minibatch.
-		grad_fn (tp.Callable[[jax.Array, tp.Dict], tp.Tuple[jax.Array, LossMetrics]]):
-			A function that computes the gradients and metrics for a given minibatch.
-
-	Returns:
-		tp.Tuple[jax.Array, LossMetrics]: The accumulated gradients and metrics over all minibatches.
+	Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
+	Uses eval_shape to initialize accumulator structures efficiently.
 	"""
+	num_accum_steps = len(next(iter(batch.values()))) // minibatch_size
+	if num_accum_steps > 1:
 
-	def _minibatch_step(minibatch_idx: jax.Array | int):
-		minibatch = jax.tree_map(
-			lambda x: jax.lax.dynamic_slice_in_dim(
-				x,
-				start_index=minibatch_idx * minibatch_size,
-				slice_size=minibatch_size,
-				axis=0,
-			),
-			batch,
-		)
-		(_, step_metrics), step_grads = grad_fn(state.graphstate, minibatch)
-		return step_grads, step_metrics
+		def reshape_to_minibatches(arr):
+			"""Reshape the batch into minibatches for accumulation."""
+			batch_shape = (num_accum_steps, minibatch_size) + arr.shape[1:]
+			return jnp.reshape(arr, batch_shape)
 
-	def _scan_step(carry, minibatch_idx: jax.Array | int):
-		step_grads, step_metrics = _minibatch_step(minibatch_idx)
-		carry = jax.tree_map(jnp.add, carry, (step_grads, step_metrics))
-		return carry, None
+		batch = jax.tree_map(reshape_to_minibatches, batch)
 
-	grads_shapes, metrics_shape = jax.eval_shape(_minibatch_step, 0)
-	gradients = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
-	metrics = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
-
-	if os.environ.get("SCAN_TRAINER", "true").lower() in ["true", "1", "on", "yes"]:
-		(gradients, metrics), _ = jax.lax.scan(
-			_scan_step,
-			init=(gradients, metrics),
-			xs=jnp.arange(minibatch_size),
-			length=minibatch_size,
-		)
-	else:
-		for minibatch_idx in range(minibatch_size):
-			(gradients, metrics), _ = _scan_step(
-				(gradients, metrics),
-				minibatch_idx,
+		(_, metrics_shape), grads_shape = jax.eval_shape(
+			lambda: grad_fn(
+				state.graphstate,
+				jax.tree_map(lambda x: x[0], batch),
 			)
+		)
 
-	if minibatch_size != 1:
-		gradients = jax.tree_util.tree_map(lambda g: g / minibatch_size, gradients)
-		metrics = jax.tree_util.tree_map(lambda m: m / minibatch_size, metrics)
+		init_acc = {
+			"grads": jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shape),
+			"metrics": jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape),
+		}
+
+		def accumulate_gradients(acc, minibatch):
+			"""Accumulate gradients and metrics for each minibatch."""
+			(_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
+			new_acc = {
+				"grads": jax.tree_map(jnp.add, acc["grads"], step_grads),
+				"metrics": jax.tree_map(jnp.add, acc["metrics"], step_aux),
+			}
+			return new_acc, step_aux
+
+		final_acc, aux = jax.lax.scan(
+			accumulate_gradients,
+			init_acc,
+			batch,
+			length=num_accum_steps,
+		)
+		gradients = jax.tree_map(lambda x: x / num_accum_steps, final_acc["grads"])
+		metrics = jax.tree_map(lambda x: x / num_accum_steps, final_acc["metrics"])
+
+	else:
+		(_, metrics), gradients = grad_fn(state.graphstate, batch)
 
 	return gradients, metrics

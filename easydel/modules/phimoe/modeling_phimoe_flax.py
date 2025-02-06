@@ -50,7 +50,7 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -87,7 +87,7 @@ class PhiMoEAttention(FlaxAttentionModule):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -274,7 +274,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -340,7 +340,6 @@ class PhiMoeSparseMoeBlock(nn.Module):
 					self.experts[index],
 					hidden_states,
 					self.config.scan_mlp_chunk_size,
-					deterministic,
 				)
 				if self.config.use_scan_mlp
 				else self.experts[index](hidden_states)
@@ -365,7 +364,7 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -477,7 +476,7 @@ class PhiMoeModel(EasyDeLBaseModule):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -609,7 +608,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -685,7 +684,11 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 		if self.config.tie_word_embeddings:
 			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
 			# lm_logits = self.lm_head(hidden_states)
-			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 		if not return_dict:

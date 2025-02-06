@@ -20,6 +20,7 @@ import typing as tp
 # from functools import partial
 from functools import partial
 
+import chex
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
@@ -144,7 +145,7 @@ def rope_wraper(type):
 
 
 def compute_basic_inv_frequencies(base: int, rotary_dim: int):
-	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim))
+	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype="f4") / rotary_dim))
 
 
 def compute_yarn_inv_frequencies(
@@ -496,6 +497,8 @@ class RotaryEmbedding(nn.Module):
 					rotary_dim=self.rotary_dim,
 					max_position_embeddings=self.max_position_embeddings,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -548,6 +551,8 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 					max_position_embeddings=self.max_position_embeddings,
 					scaling_factors=self.scaling_factors,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -602,6 +607,8 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 					max_position_embeddings=self.max_position_embeddings,
 					scaling_factor=self.scaling_factor,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -672,6 +679,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 					extrapolation_factor=self.extrapolation_factor,
 					attn_factor=self.attn_factor,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -731,6 +740,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 					short_factor=self.short_factor,
 					long_factor=self.long_factor,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_phi3_rope(
 				query=query,
 				key=key,
@@ -790,6 +801,8 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 					scaling_factor=self.scaling_factor,
 					max_position_embeddings=self.orig_max_position,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 
 			return apply_basic_rope(
 				query=query,
@@ -1208,3 +1221,45 @@ if __name__ == "__main__":
 		base,
 		rope_scaling,
 	)
+
+
+@chex.dataclass
+class RopeConfig:
+	"""Configuration class for RoPE (Rotary Position Embedding) parameters."""
+
+	rope_type: str = "default"
+	factor: tp.Optional[float] = None
+	low_freq_factor: tp.Optional[float] = None
+	high_freq_factor: tp.Optional[float] = None
+	original_max_position_embeddings: tp.Optional[int] = None
+	long_factor: tp.Optional[float] = None
+	short_factor: tp.Optional[float] = None
+	long_mscale: tp.Optional[float] = None
+	short_mscale: tp.Optional[float] = None
+
+	@classmethod
+	def from_dict(cls, config_dict: tp.Dict[str, tp.Any]) -> "RopeConfig":
+		"""Create a RopeConfig instance from a dictionary."""
+		return cls(
+			rope_type=config_dict.get("rope_type") or config_dict.get("type", "default"),
+			factor=config_dict.get("factor"),
+			low_freq_factor=config_dict.get("low_freq_factor"),
+			high_freq_factor=config_dict.get("high_freq_factor"),
+			original_max_position_embeddings=config_dict.get(
+				"original_max_position_embeddings"
+			),
+			long_factor=config_dict.get("long_factor"),
+			short_factor=config_dict.get("short_factor"),
+			long_mscale=config_dict.get("long_mscale"),
+			short_mscale=config_dict.get("short_mscale"),
+		)
+
+	def to_dict(self) -> tp.Dict[str, tp.Any]:
+		"""Convert the config to a dictionary, excluding None values."""
+		from easydel.utils.compiling_utils import hash_fn
+
+		class rope_scaling(dict):
+			__hash__ = hash_fn
+
+		scale = rope_scaling({k: v for k, v in self.__dict__.items() if v is not None})
+		return scale

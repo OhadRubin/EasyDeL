@@ -17,24 +17,26 @@ import functools
 import re
 import typing as tp
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from jax.sharding import PartitionSpec
 
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.etils import (
 	AVAILABLE_OPTIMIZERS,
-	AVAILABLE_PRUNING_TYPE,
 	AVAILABLE_SCHEDULERS,
 	AVAILABLE_SPARSE_MODULE_TYPES,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
 from .utils import JaxDistributedConfig
@@ -66,8 +68,10 @@ AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 @dataclass
 class TrainingArguments:
 	auto_shard_states: bool = True
+	aux_loss_enabled: bool = False
 	backend: tp.Optional[str] = None
 	clip_grad: tp.Optional[float] = None
+	custom_scheduler: tp.Optional[tp.Callable[[int], tp.Any]] = None
 	dataloader_num_workers: tp.Optional[int] = 0
 	dataloader_pin_memory: tp.Optional[bool] = False
 	do_eval: bool = False
@@ -88,20 +92,26 @@ class TrainingArguments:
 	report_metrics: bool = True
 	log_steps: int = 10
 	loss_config: tp.Optional[LossConfig] = None
+	low_mem_usage: bool = True
 	max_evaluation_steps: tp.Optional[int] = None
 	max_sequence_length: tp.Optional[int] = 4096
 	max_training_steps: tp.Optional[int] = None
 	model_name: str = "EasyDeL-Model"
 	model_parameters: tp.Optional[dict] = None
+	metrics_to_show_in_rich_pbar: tp.Optional[list] = None
 	num_train_epochs: int = 10
-	offload_device: jax.Device = jax.devices("cpu")[0]
+	offload_device_type: str = "cpu"
+	offload_device_index: int = 0
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
 	performance_mode: bool = False
-	pruning_module: AVAILABLE_PRUNING_TYPE = None
+	pruning_module: tp.Any = None
+	process_zero_is_admin: bool = True
+	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "tqdm"
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
+	report_steps: int = 5
 	save_directory: str = "EasyDeL-Checkpoints"
-	save_optimizer_state: bool = False
+	save_optimizer_state: bool = True
 	save_steps: tp.Optional[int] = None
 	save_total_limit: tp.Optional[int] = None
 	scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE
@@ -110,6 +120,7 @@ class TrainingArguments:
 	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = None
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
 	step_start_point: tp.Optional[int] = None
+	shuffle_train_dataset: bool = True
 	total_batch_size: int = 32
 	training_time_limit: tp.Optional[str] = None
 	train_on_inputs: bool = True
@@ -120,14 +131,22 @@ class TrainingArguments:
 	use_wandb: bool = True
 	verbose: bool = True
 	wandb_entity: tp.Optional[str] = None
-	warmup_steps: int = 500
+	warmup_steps: int = 0
 	weight_decay: float = 0.01
+
+	@property
+	def offload_device(self):
+		return jax.devices(self.offload_device_type)[self.offload_device_index]
 
 	@property
 	def training_time_seconds(self) -> int:
 		if self.training_time_limit is None:
 			return None
 		return self._time_to_seconds(self.training_time_limit)
+
+	@functools.cached_property
+	def is_process_zero(self):
+		return jax.process_index() == 0
 
 	def __post_init__(self):
 		"""
@@ -146,13 +165,10 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert (
-			self.gradient_accumulation_steps > 0
-		), "`gradient_accumulation_steps` can't be lower than 1."
-		if self.total_batch_size % self.gradient_accumulation_steps != 0:
-			raise ValueError(
-				"Number of `total_batch_size` should be even with `gradient_accumulation_steps`"
-			)
+		assert self.gradient_accumulation_steps > 0, (
+			"`gradient_accumulation_steps` can't be lower than 1."
+		)
+
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
 				f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}"
@@ -184,6 +200,7 @@ class TrainingArguments:
 			"gradient_accumulation_steps": self.gradient_accumulation_steps,
 			"weight_decay": self.weight_decay,
 			"steps": self.max_training_steps,
+			"clip_grad": self.clip_grad,
 			"mu_dtype": self.tx_mu_dtype,
 			**extra_optimizer_kwargs,
 		}
@@ -199,6 +216,13 @@ class TrainingArguments:
 		if self.report_metrics and self.performance_mode:
 			logger.info("Metrics reporting disabled due to performance mode")
 			self.report_metrics = False
+		if self.report_metrics:
+			if not self.is_process_zero and not self.log_all_workers:
+				logger.info(
+					"Metrics reporting disabled and it's only working on process index 0 or "
+					"admin process (`log_all_workers` is `False`)."
+				)
+				self.report_metrics = False
 
 	def _ensure_variables(self):
 		"""
@@ -272,18 +296,39 @@ class TrainingArguments:
 		Returns:
 		    tuple: A tuple containing the optimizer and scheduler.
 		"""
-		from easydel.trainers.auto_tx import get_optimizer_and_scheduler
 
 		self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
-		tx, sc = get_optimizer_and_scheduler(**self.optimizer_kwargs)
-		return tx, sc
+		optimizer_kwargs = deepcopy(self.optimizer_kwargs)
+		scheduler = optimizer_kwargs.pop("scheduler", None)
+		if scheduler == "none":
+			scheduler = None
+		if scheduler == EasyDeLSchedulers.NONE:
+			scheduler = None
+		scheduler_config = SchedulerConfig(
+			scheduler_type=scheduler,
+			steps=optimizer_kwargs.pop("steps"),
+			learning_rate=optimizer_kwargs.pop("learning_rate"),
+			learning_rate_end=optimizer_kwargs.pop("learning_rate_end"),
+			warmup_steps=optimizer_kwargs.pop("warmup_steps"),
+			exponent=optimizer_kwargs.pop("exponent", 1),
+		)
+		optimizer_kwargs.pop("gradient_accumulation_steps", 0)
+		optimizer, scheduler = OptimizerFactory.create(
+			optimizer_type=optimizer_kwargs.pop("optimizer"),
+			scheduler_config=scheduler_config,
+			clip_grad=optimizer_kwargs.pop("clip_grad"),
+			weight_decay=optimizer_kwargs.pop("weight_decay"),
+			custom_scheduler=self.custom_scheduler,
+			**optimizer_kwargs,
+		)
+		return optimizer, scheduler
 
 	def get_streaming_checkpointer(self):
 		"""
 		Returns the checkpoint manager, responsible for saving model checkpoints.
 
 		Returns:
-		    fjformer.CheckpointManager: The checkpoint manager.
+		    CheckpointManager: The checkpoint manager.
 		"""
 		import os.path
 
@@ -326,13 +371,12 @@ class TrainingArguments:
 				)
 				return None
 
-			if jax.process_index() == 0 or self.log_all_workers:
-				return wandb.init(
-					project=f"EasyDeL-{self.model_name}",
-					config=self.to_dict(),
-					tags=["EasyDeL", "JAX/Flax"],
-					entity=self.wandb_entity,
-				)
+			return wandb.init(
+				project=f"EasyDeL-{self.model_name}",
+				config=self.to_dict(),
+				tags=["EasyDeL", "JAX/Flax"],
+				entity=self.wandb_entity,
+			)
 		return None
 
 	def ensure_training_time_limit(self, time_passed):
@@ -341,68 +385,92 @@ class TrainingArguments:
 		):
 			raise EasyDeLTimerError("Time Out")
 
-	def log_metrics(self, metrics: MetricsType, step: int):
+	def log_metrics(
+		self,
+		metrics: MetricsType,
+		step: int,
+		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
+	):
 		"""
 		Logs training metrics to Weights & Biases and/or TensorBoard.
 
 		Args:
-			metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
-				A dictionary where keys are metric names and values are metric values.
-			step (int): The current training step or iteration.
+		  metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
+		    A dictionary where keys are metric names and values are metric values.
+		  step (int): The current training step or iteration.
 		"""
 		if self.report_metrics:
-			if (step + 1) % self.log_steps == 0:
-				if jax.process_index() == 0 or self.log_all_workers:
-					metrics = {self._restructure_metric_name(k): v for k, v in metrics.items()}
-					self._log_to_wandb(metrics, step)
-					self._log_to_tensorboard(metrics, step)
+			metrics = {
+				self._restructure_metric_name(k): v for k, v in metrics.items() if v is not None
+			}
+			self._log_to_wandb(metrics, step, log_as)
+			self._log_to_tensorboard(metrics, step, log_as)
 
 	def _restructure_metric_name(self, metric_name: str) -> str:
 		"""
 		Restructures the metric name for logging.
 
 		Args:
-			metric_name (str): The original metric name.
+		  metric_name (str): The original metric name.
 
 		Returns:
-			str: The restructured metric name.
+		  str: The restructured metric name.
 		"""
 		if metric_name.startswith("train/grad_norm/"):
 			return metric_name.replace("train/grad_norm/", "grad_norm/")
 		return metric_name
 
-	def _log_to_wandb(self, metrics, step):
+	def _log_to_wandb(
+		self,
+		metrics,
+		step,
+		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
+	):
 		"""
 		Log metrics to Weights & Biases (wandb).
 
 		This method processes the given metrics and logs them to wandb if it's enabled and properly initialized.
 
 		Args:
-			metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-			step (int): The current step or iteration number.
+		  metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+		  step (int): The current step or iteration number.
 		"""
-		if self.use_wandb and wandb is not None and self.report_metrics:
-			wandb_metrics = {}
-			for key, value in metrics.items():
-				try:
-					wandb_metrics[key] = (
-						self._create_wandb_histogram(value)
-						if isinstance(value, (list, tuple, np.ndarray, jnp.ndarray))
-						else value
-					)
-				except Exception as e:
-					warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
-			wandb.log(wandb_metrics, step=step)
 
-	def _log_to_tensorboard(self, metrics, step):
+		if self.use_wandb and wandb is not None:
+			if log_as == "summary":
+				wandb.summary.update(metrics)
+			elif log_as == "config":
+				wandb.config.update(metrics)
+			else:
+				wandb_metrics = {}
+				for key, value in metrics.items():
+					try:
+						wandb_metrics[key] = (
+							self._create_wandb_histogram(value)
+							if isinstance(value, (list, tuple, np.ndarray, jnp.ndarray))
+							else value
+						)
+					except Exception as e:
+						warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
+				try:
+					wandb.log(wandb_metrics, step=step)
+				except Exception:
+					...
+
+	def _log_to_tensorboard(
+		self,
+		metrics,
+		step,
+		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
+	):
 		"""
 		Log metrics to TensorBoard.
 
 		This method processes the given metrics and logs them to TensorBoard.
 
 		Args:
-			metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-			step (int): The current step or iteration number.
+		    metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+		    step (int): The current step or iteration number.
 		"""
 		summary_writer = self.get_tensorboard()
 		for key, value in metrics.items():
@@ -413,7 +481,8 @@ class TrainingArguments:
 					summary_writer.histogram(key, np.array(value), step)
 			except Exception as e:
 				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
-		summary_writer.flush()
+			finally:
+				summary_writer.flush()
 
 	def _create_wandb_histogram(self, value):
 		"""
@@ -511,3 +580,5 @@ class TrainingArguments:
 		if create:
 			save_directory.mkdir(exist_ok=True, parents=True)
 		return save_directory
+
+	__hash__ = hash_fn

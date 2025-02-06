@@ -17,6 +17,7 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+from flax.nnx import Param
 from flax.nnx.module import Module
 from flax.nnx.nn import initializers
 from flax.typing import (
@@ -31,6 +32,9 @@ Size = int
 
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
+
+
+class QuantParam(Param): ...
 
 
 class QauntModule(Module):

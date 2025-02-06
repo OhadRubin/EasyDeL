@@ -48,7 +48,7 @@ class Phi3MLP(nn.Module):
 		config: Phi3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -92,7 +92,7 @@ class Phi3Attention(FlaxAttentionModule):
 		config: Phi3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -270,7 +270,7 @@ class Phi3DecoderLayer(nn.Module):
 		config: Phi3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -402,7 +402,7 @@ class Phi3Model(EasyDeLBaseModule):
 		config: Phi3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -553,7 +553,7 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
 		config: Phi3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -630,7 +630,11 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
 		if self.config.tie_word_embeddings:
 			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
 			# lm_logits = self.lm_head(hidden_states)
-			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 		if not return_dict:

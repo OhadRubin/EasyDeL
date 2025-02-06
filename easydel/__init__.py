@@ -21,6 +21,7 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	# Tell jax xla bridge to stay quiet and only yied warnings or errors.
 	_getLogger("jax._src.xla_bridge").setLevel(30)
 	_getLogger("jax._src.mesh_utils").setLevel(30)
+	_getLogger("datasets").setLevel(30)
 
 	# Taking care of some optional GPU FLAGs
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -48,6 +49,30 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 		"--xla_gpu_enable_latency_hiding_scheduler=true  "
 		"--xla_gpu_enable_command_buffer=  "
 	)
+	_os.environ["LIBTPU_INIT_ARGS"] = (
+		_os.environ.get("LIBTPU_INIT_ARGS", "") + " "
+		"--xla_jf_spmd_threshold_for_windowed_einsum_mib=0 "
+		"--xla_tpu_spmd_threshold_for_allgather_cse=10000  "
+		"--xla_tpu_enable_latency_hiding_scheduler=true "
+		"--xla_tpu_megacore_fusion_allow_ags=false "
+		"--xla_enable_async_collective_permute=true "
+		"--xla_tpu_enable_ag_backward_pipelining=true "
+		"--xla_tpu_enable_data_parallel_all_reduce_opt=true "
+		"--xla_tpu_data_parallel_opt_different_sized_ops=true "
+		"--xla_tpu_enable_async_collective_fusion=true "
+		"--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
+		"--xla_tpu_overlap_compute_collective_tc=true "
+		"--xla_enable_async_all_gather=true "
+		"--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
+		"TPU_MEGACORE=MEGACORE_DENSE "
+	)
+	_os.environ.update(
+		{
+			"NCCL_LL128_BUFFSIZE": "-2",
+			"NCCL_LL_BUFFSIZE": "-2",
+			"NCCL_PROTO": "SIMPLE,LL,LL128",
+		}
+	)
 	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 	if _os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
 		_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
@@ -60,10 +85,9 @@ del _getLogger
 from packaging.version import Version as _Version
 
 # fmt: off
-from . import utils # utils should be improted first to prevent circular imports
-from . import escale
+from . import utils  # utils should be improted first to prevent circular imports
+
 # fmt: on
-from .escale import PartitionAxis
 from .inference.vinference import (
 	vInference,
 	vInferenceApiServer,
@@ -137,6 +161,7 @@ from .modules.clip import (
 from .modules.cohere import (
 	CohereConfig,
 	CohereForCausalLM,
+	CohereForSequenceClassification,
 	CohereModel,
 )
 from .modules.dbrx import (
@@ -144,6 +169,7 @@ from .modules.dbrx import (
 	DbrxConfig,
 	DbrxFFNConfig,
 	DbrxForCausalLM,
+	DbrxForSequenceClassification,
 	DbrxModel,
 )
 from .modules.deepseek_v2 import (
@@ -159,6 +185,7 @@ from .modules.deepseek_v3 import (
 from .modules.exaone import (
 	ExaoneConfig,
 	ExaoneForCausalLM,
+	ExaoneForSequenceClassification,
 	ExaoneModel,
 )
 from .modules.falcon import (
@@ -169,11 +196,13 @@ from .modules.falcon import (
 from .modules.gemma import (
 	GemmaConfig,
 	GemmaForCausalLM,
+	GemmaForSequenceClassification,
 	GemmaModel,
 )
 from .modules.gemma2 import (
 	Gemma2Config,
 	Gemma2ForCausalLM,
+	Gemma2ForSequenceClassification,
 	Gemma2Model,
 )
 from .modules.gpt2 import (
@@ -221,11 +250,13 @@ from .modules.mamba2 import (
 from .modules.mistral import (
 	MistralConfig,
 	MistralForCausalLM,
+	MistralForSequenceClassification,
 	MistralModel,
 )
 from .modules.mixtral import (
 	MixtralConfig,
 	MixtralForCausalLM,
+	MixtralForSequenceClassification,
 	MixtralModel,
 )
 from .modules.mosaic_mpt import (
@@ -242,6 +273,7 @@ from .modules.olmo import (
 from .modules.olmo2 import (
 	Olmo2Config,
 	Olmo2ForCausalLM,
+	Olmo2ForSequenceClassification,
 	Olmo2Model,
 )
 from .modules.openelm import (
@@ -282,6 +314,7 @@ from .modules.qwen2 import (
 from .modules.qwen2_moe import (
 	Qwen2MoeConfig,
 	Qwen2MoeForCausalLM,
+	Qwen2MoeForSequenceClassification,
 	Qwen2MoeModel,
 )
 from .modules.qwen2_vl import (
@@ -313,6 +346,11 @@ from .modules.xerxes import (
 	XerxesForCausalLM,
 	XerxesModel,
 )
+from .modules.xerxes2 import (
+	Xerxes2Config,
+	Xerxes2ForCausalLM,
+	Xerxes2Model,
+)
 from .trainers import (
 	BaseTrainer,
 	DPOConfig,
@@ -333,15 +371,17 @@ from .utils.parameters_transformation import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.91"]
+_targeted_versions = ["0.0.4"]
 
-from fjformer import __version__ as _fjformer_version
+from eformer import __version__ as _eform_version
+from eformer import escale
+from eformer.escale import PartitionAxis
 
-assert _Version(_fjformer_version) in [
+assert _Version(_eform_version) in [
 	_Version(_targeted_version) for _targeted_version in _targeted_versions
 ], (
-	f"this version of EasyDeL is only compatible with fjformer {', '.join(_targeted_versions)},"
-	f" but found fjformer {_fjformer_version}"
+	f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_versions)},"
+	f" but found eformer {_eform_version}"
 )
 import jax as _jax
 
@@ -352,9 +392,10 @@ if _jax.default_backend() == "gpu":
 		del torch
 	except ModuleNotFoundError:
 		print(
-			"UserWarning: please install `torch-cpu` since `easydel` "
-			"uses `triton` and `triton` uses `torch` for autotuning.",
+			"UserWarning: please install `torch` (cpu or gpu) since `easydel` "
+			"uses `triton` and `triton` uses `torch` for autotuning, "
+			"and you can not use AutoEasyModel from torch.",
 		)
 del _jax
 del _Version
-del _fjformer_version
+del _eform_version

@@ -45,7 +45,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -88,6 +88,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=self.config.attn_mechanism,
 			dtype=self.config.attn_dtype,
+			softmax_dtype=self.config.attn_softmax_dtype,
 			partition_axis=self.config.partition_axis,
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,
@@ -173,7 +174,7 @@ class GPTNeoXMlp(nn.Module):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -213,7 +214,7 @@ class GPTNeoXBlock(nn.Module):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:

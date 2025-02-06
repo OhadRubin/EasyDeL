@@ -458,7 +458,7 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		_do_init: bool = True,
 		**kwargs,
 	):
@@ -596,7 +596,6 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	model_type="rwkv",
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
-	rnn_based_or_rwkv=True,
 )
 class FlaxRwkvModel(nn.Module):
 	config: RwkvConfig
@@ -718,7 +717,6 @@ class FlaxRwkvModel(nn.Module):
 	model_type="rwkv",
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
-	rnn_based_or_rwkv=True,
 )
 class FlaxRwkvForCausalLM(nn.Module):
 	config: RwkvConfig

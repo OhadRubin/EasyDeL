@@ -27,6 +27,7 @@ from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
+	FlaxSequenceClassifierOutput,
 )
 from easydel.infra.utils import (
 	auto_remat,
@@ -80,7 +81,16 @@ class RMSNorm(nn.Module):
 		return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-		x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
+		if self.dtype in [
+			jnp.float8_e4m3b11fnuz,
+			jnp.float8_e4m3fn,
+			jnp.float8_e4m3fnuz,
+			jnp.float8_e5m2,
+			jnp.float8_e5m2fnuz,
+		]:
+			x = x.astype(jnp.float32)
+		else:
+			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
 		weight = self.kernel.value.astype(self.dtype)
 		if self.do_t:
@@ -94,7 +104,7 @@ class CohereAttention(FlaxAttentionModule):
 		config: CohereConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -279,7 +289,7 @@ class CohereMLP(nn.Module):
 		config: CohereConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -327,7 +337,7 @@ class CohereBlock(nn.Module):
 		config: CohereConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -441,7 +451,7 @@ class CohereModel(EasyDeLBaseModule):
 		config: CohereConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -560,7 +570,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		config: CohereConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -647,7 +657,11 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		if self.config.tie_word_embeddings:
 			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
 			# lm_logits = self.lm_head(hidden_states)
-			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
@@ -661,4 +675,108 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			past_key_values=outputs.past_key_values,
+		)
+
+
+@register_module(
+	"sequence-classification",
+	config=CohereConfig,
+	model_type="cohere",
+	embedding_layer_names=["embed_tokens"],
+)
+class CohereForSequenceClassification(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: CohereConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.model = CohereModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+
+		assert hasattr(
+			config, "num_labels"
+		), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		self.score = nn.Linear(
+			config.hidden_size,
+			config.num_labels,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			precision=precision,
+			rngs=rngs,
+		)
+
+	def __call__(
+		self,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		return_dict: bool = True,
+	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
+		transformer_outputs = self.model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			past_key_values=past_key_values,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			inputs_embeds=inputs_embeds,
+			segment_ids=segment_ids,
+		)
+
+		hidden_states = transformer_outputs[0]
+		logits = self.score(hidden_states)
+		if input_ids is not None:
+			batch_size = input_ids.shape[0]
+		else:
+			batch_size = inputs_embeds.shape[0]
+
+		if self.config.pad_token_id is None and batch_size != 1:
+			raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+		if self.config.pad_token_id is None:
+			sequence_lengths = -1
+		else:
+			if input_ids is not None:
+				sequence_lengths = (
+					jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1)
+					- 1
+				)
+				sequence_lengths = sequence_lengths % input_ids.shape[-1]
+			else:
+				sequence_lengths = -1
+
+		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+
+		if not return_dict:
+			output = (pooled_logits,) + transformer_outputs[1:]
+			return output
+
+		return FlaxSequenceClassifierOutput(
+			logits=pooled_logits,
+			past_key_values=past_key_values,
+			hidden_states=transformer_outputs.hidden_states,
+			attentions=transformer_outputs.attentions,
 		)

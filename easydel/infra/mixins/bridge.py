@@ -23,13 +23,13 @@ from pathlib import Path
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.utils.generic import working_or_temp_dir
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.escale import PartitionAxis
 from easydel.utils.checkpoint_managers import CheckpointManager
 from easydel.utils.helpers import get_logger
 from easydel.utils.readme_generator import (
@@ -53,7 +53,11 @@ from ..etils import (
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
 )
-from ..utils import quantize_linear_layers
+
+if tp.TYPE_CHECKING:
+	from ..base_module import EasyDeLBaseModule
+else:
+	EasyDeLBaseModule = tp.Any
 
 logger = get_logger(__name__)
 
@@ -101,6 +105,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
+		enable: tp.Optional[bool] = None,
 	):
 		"""Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
@@ -110,11 +115,15 @@ class EasyBridgeMixin(PushToHubMixin):
 		  float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
 		  verbose (bool, optional): Whether to print verbose messages. Defaults to True.
 		  mismatch_allowed (bool, optional): If True allows mismatch in parameters. Defaults to True.
+			enable (bool): if True, allows file to be saved (used for multi-host saving models).
 		"""
+
 		save_directory.mkdir(parents=True, exist_ok=True)
 
 		config_to_save = deepcopy(self.config)
-		config_to_save.__dict__.pop("attn_dtype", None)  # Make sure dtypes are not included
+		config_to_save.__dict__.pop("attn_dtype", None)
+		config_to_save.__dict__.pop("attn_softmax_dtype", None)
+		# Make sure dtypes are not included
 		config_to_save.architectures = [self.__class__.__name__]
 		config_to_save.save_pretrained(str(save_directory))
 
@@ -123,14 +132,16 @@ class EasyBridgeMixin(PushToHubMixin):
 
 		output_model_file = save_directory / FLAX_WEIGHTS_NAME
 		state = nn.split(self, nn.Param, ...)[1]
-
-		CheckpointManager.save_checkpoint(
+		if gather_fns is None:
+			gather_fns = self._gather_fns
+		output_model_file = CheckpointManager.save_checkpoint(
 			state=state.to_pure_dict(),
 			path=str(output_model_file),
 			gather_fns=gather_fns,
 			mismatch_allowed=mismatch_allowed,
 			float_dtype=float_dtype,
 			verbose=verbose,
+			enable=enable,
 		)
 
 		logger.info(f"Model weights saved in {output_model_file}")
@@ -144,6 +155,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
+		enable: tp.Optional[bool] = None,
 		**kwargs,
 	):
 		"""Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -156,9 +168,13 @@ class EasyBridgeMixin(PushToHubMixin):
 		    float_dtype (dtype, optional): Data type for saving weights.
 		    verbose (bool, optional): Whether to print verbose messages. Defaults to True.
 		    mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
+				enable (bool): if True, allows file to be saved (used for multi-host saving models).
 		    **kwargs: Additional keyword arguments for Hugging Face Hub.
 		"""
+
 		save_directory = Path(save_directory)
+		if enable is None:
+			enable = jax.process_index() == 0
 
 		if save_directory.is_file():
 			logger.error(
@@ -173,18 +189,18 @@ class EasyBridgeMixin(PushToHubMixin):
 			files_timestamps = self._get_files_timestamps(save_directory)
 
 		self._save_model_files(
-			save_directory,
-			gather_fns,
-			float_dtype,
-			verbose,
-			mismatch_allowed,
+			save_directory=save_directory,
+			gather_fns=gather_fns,
+			float_dtype=float_dtype,
+			verbose=verbose,
+			mismatch_allowed=mismatch_allowed,
+			enable=enable,
 		)
-
 		readme_path = save_directory / "README.md"
-		if not readme_path.exists():
+		if not readme_path.exists() and enable:
 			readme_path.write_text(self._model_card(repo_id, repo_id))
 
-		if push_to_hub:
+		if push_to_hub and enable:
 			self._upload_modified_files(
 				str(save_directory),
 				repo_id,
@@ -287,30 +303,48 @@ class EasyBridgeMixin(PushToHubMixin):
 	def _load_model_weights(
 		cls,
 		resolved_archive_file: tp.Optional[str],
-		model: nn.Module,
+		model: EasyDeLBaseModule,
+		param_dtype: jnp.dtype,
 		mismatch_allowed: bool,
 		verbose: bool,
 		shard_fns: tp.Optional[dict[tp.Callable]],
-	) -> nn.Module:
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods],
+		quantization_block_size: int,
+		quantize_tensors: bool,
+		vebose: bool,
+	) -> EasyDeLBaseModule:
 		"""Loads model weights from a checkpoint file.
 
 		Args:
 		    resolved_archive_file: The path to the checkpoint file.
-		    model: A Flax model.
+		    model: an easydel model.
 		    mismatch_allowed: If True, allows mismatch in parameters while loading.
 		    verbose: Whether to print verbose messages.
 		    shard_fns: Custom shard functions for loading checkpoint.
 
 		Returns:
-		    A flax Module, with loaded parameter.
+		    an easydel, with loaded parameter.
 		"""
+		callback = None
+		if quantize_tensors:
+			from easydel.layers.quantization.quantizers import EasyQuantizer
+
+			quantizer = EasyQuantizer(
+				quantization_method=quantization_method,
+				block_size=quantization_block_size,
+			)
+
+			def callback(x, p):
+				return quantizer(x)
+
 		if resolved_archive_file:
 			state, _ = CheckpointManager.load_checkpoint(
 				path=resolved_archive_file,
 				mismatch_allowed=mismatch_allowed,
 				verbose=verbose,
 				shard_fns=shard_fns,
-				callback=None,
+				callback=callback,
+				dtype=param_dtype,
 			)
 
 			params = state.get("params", None)
@@ -321,11 +355,19 @@ class EasyBridgeMixin(PushToHubMixin):
 
 			required_params = set(flatten_dict(model.graphtree_params_shape))
 			unexpected_keys = set(state.keys()) - required_params
-
+			if any([k[-1].startswith("quant_") for k in state.keys()]):
+				model = model.quantize(
+					method=quantization_method,
+					block_size=quantization_block_size,
+					verbose=vebose,
+				)
 			for unexpected_key in unexpected_keys:
 				del state[unexpected_key]
 
-			return merge_model_and_tree(model=model, tree=unflatten_dict(state))
+			return merge_model_and_tree(
+				model=model,
+				tree=unflatten_dict(state),
+			)
 
 		else:
 			return model
@@ -355,6 +397,11 @@ class EasyBridgeMixin(PushToHubMixin):
 		local_files_only: bool = False,
 		token: tp.Optional[tp.Union[str, bool]] = None,
 		revision: str = "main",
+		vebose: bool = True,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		quantize_tensors: bool = False,
 		**kwargs,
 	):
 		"""Loads an EasyDeL model from a pretrained model or path.
@@ -400,8 +447,6 @@ class EasyBridgeMixin(PushToHubMixin):
 			get_modules_by_type,
 		)
 
-		from ..utils import quantize_linear_layers
-
 		api = HfApi(token=token)
 
 		proxies = kwargs.pop("proxies", None)
@@ -434,6 +479,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			from_torch=False,
 			backend=backend,
 			platform=platform,
+			model_task=cls._model_task,
 		)
 
 		if config_kwargs:
@@ -447,6 +493,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				config=config,
 				flatten=False,
 				partition_rules=partition_rules,
+				model_task=cls._model_task,
 			)
 			fns = {"params": shard_fns}
 			fns.update(shard_fns)
@@ -524,21 +571,28 @@ class EasyBridgeMixin(PushToHubMixin):
 			precision=precision,
 			rngs=nn.Rngs(0),
 		)
-		model = quantize_linear_layers(
-			model,
-			method=config.quantization_method,
-			block_size=config.quantization_blocksize,
-			quantization_pattern=config.quantization_pattern,
-		)
 
 		model = cls._load_model_weights(
 			resolved_archive_file,
 			model,
+			param_dtype,
 			mismatch_allowed,
 			verbose,
 			shard_fns,
+			quantization_method,
+			quantization_block_size,
+			quantize_tensors,
+			vebose,
 		)
-
+		if not quantize_tensors:  # already quantized
+			model = model.quantize(
+				method=quantization_method,
+				block_size=quantization_block_size,
+				quantize_tensors=quantize_tensors,
+				verbose=vebose,
+			)
+		if auto_shard_model:
+			model = model.shard_model()
 		if model.can_generate():
 			try:
 				model.generation_config = GenerationConfig.from_pretrained(
@@ -579,13 +633,16 @@ class EasyBridgeMixin(PushToHubMixin):
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_model: bool = False,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantize_tensors: bool = False,
 		verbose: bool = True,
 		**kwargs,
 	):
 		from transformers import AutoConfig
 
+		from easydel.layers.quantization.quantizers import EasyQuantizer
 		from easydel.modules.auto.auto_configuration import (
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,
@@ -690,6 +747,18 @@ class EasyBridgeMixin(PushToHubMixin):
 		logger.debug("converting huggingface-model to easydel-model.")
 		params_pattern_selection = None
 		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
+
+		quantizer = EasyQuantizer(
+			quantization_method=quantization_method,
+			block_size=quantization_block_size,
+			quantization_platform=quantization_platform,
+		)
+		callback = None
+		if quantize_tensors:
+
+			def callback(x, p):
+				return quantizer(x)
+
 		params = model.pure_transform_fn(
 			state_dict,
 			config=config,
@@ -698,21 +767,31 @@ class EasyBridgeMixin(PushToHubMixin):
 			params_pattern_selection=params_pattern_selection,
 			remove_state_dict=True,
 			uses_tie_word_embedding=uses_tie_word_embedding,
+			callback=callback,
 		)
 		del state_dict
 		_clear()
 		if is_flatten(params):
-			logger.info("converted parameters are flatten making them unflatten ")
+			logger.info("converted parameters are flatten making them unflatten.")
 			params = unflatten_dict(params)
-		model = merge_model_and_tree(model=model, tree=params)
 
-		if quantization_method is not None:
-			model = quantize_linear_layers(
-				model,
+		logger.debug("merging model and parameters pytree.")
+		model = merge_model_and_tree(model=model, tree=params)
+		logger.debug("model and parameters pytree merged.")
+		if auto_shard_model:
+			model = model.fully_shard()
+		if (
+			quantization_method is not None
+			and quantization_method != EasyDeLQuantizationMethods.NONE
+			and not quantize_tensors
+		):
+			logger.debug("quantizing model.")
+			model = model.quantize(
 				method=quantization_method,
 				block_size=quantization_block_size,
 				verbose=verbose,
 			)
+		logger.debug("returning model.")
 		return model
 
 	@classmethod
