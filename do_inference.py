@@ -20,7 +20,7 @@ print("Number of JAX devices:", num_devices)
 
 max_length = 6144
 
-pretrained_model_name_or_path = "NaniDAO/Meta-Llama-3.1-8B-Instruct-ablated-v1"
+pretrained_model_name_or_path = "meta-llama/Llama-3.1-8B-Instruct"
 dtype = jnp.bfloat16
 
 # Create partition_axis telling EasyDel how to slice each dimension
