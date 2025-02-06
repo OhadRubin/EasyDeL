@@ -34,6 +34,7 @@ partition_axis = ed.PartitionAxis(
 # Build model with the desired parallelism
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     pretrained_model_name_or_path,
+    from_torch=True,
     auto_shard_model=True,
     sharding_axis_dims=sharding_axis_dims,
     config_kwargs=ed.EasyDeLBaseConfigDict(
@@ -72,5 +73,5 @@ inference = ed.vInference(
 )
 
 # Precompile with batch_size=1
-inference.precompile(1)
+inference.precompile(8)
 print("Inference name:", inference.inference_name)
