@@ -25,8 +25,8 @@ dtype = jnp.bfloat16
 
 # Create partition_axis telling EasyDel how to slice each dimension
 partition_axis = ed.PartitionAxis(
-    # batch_axis="dp",       # Use dp to shard the batch dimension
-    # head_axis="tp",        # Use tp to shard the heads dimension
+    batch_axis="dp",       # Use dp to shard the batch dimension
+    head_axis="tp",        # Use tp to shard the heads dimension
     # query_sequence_axis=None,  # or "sp" if you want sequence parallel on queries
     # key_sequence_axis=None,    # or "sp" if you want sequence parallel on keys
 )
