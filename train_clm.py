@@ -1,3 +1,8 @@
+# . ~/venv/bin/activate && python train_clm.py
+# add this using sys.path.append
+import sys
+sys.path.append(".")
+
 from easydel import (
     TrainArguments,
     CausalLanguageModelTrainer,
