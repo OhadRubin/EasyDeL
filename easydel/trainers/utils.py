@@ -26,6 +26,7 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
 from easydel.utils.helpers import get_logger
+from easydel.infra.utils import ProcessingClassType
 
 logger = get_logger(__name__)
 
@@ -328,10 +329,7 @@ class DataCollatorForCompletionOnlyLM:
 		self.ignore_index = ignore_index
 
 	def _whole_word_mask(self, input_tokens: tp.List[str], max_predictions=512):
-		from transformers import (
-			BertTokenizer,
-			BertTokenizerFast,
-		)
+		from transformers import BertTokenizer, BertTokenizerFast
 
 		if not isinstance(self.processing_class, (BertTokenizer, BertTokenizerFast)):
 			warnings.warn(
@@ -472,7 +470,7 @@ class DataCollatorForCompletionOnlyLM:
 				if response_token_ids_start_idx is None:
 					warnings.warn(
 						f"Could not find response key `{self.response_template}` in the "
-						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
+						f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -503,7 +501,7 @@ class DataCollatorForCompletionOnlyLM:
 				if len(response_token_ids_idxs) == 0:
 					warnings.warn(
 						f"Could not find response key `{self.response_template}` in the "
-						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
+						f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -521,7 +519,7 @@ class DataCollatorForCompletionOnlyLM:
 				if len(human_token_ids_idxs) == 0:
 					warnings.warn(
 						f"Could not find instruction key `{self.instruction_template}` in the "
-						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
+						f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -546,6 +544,79 @@ class DataCollatorForCompletionOnlyLM:
 				if len(response_token_ids_idxs) < len(human_token_ids_idxs):
 					batch["labels"][i, human_token_ids_idxs[-1] :] = self.ignore_index
 
+		return batch
+
+
+@dataclass
+class RewardDataCollatorWithPadding:
+	r"""
+	Reward DataCollator class that pads the inputs to the maximum length of the batch.
+
+	Args:
+	    tokenizer (`ProcessingClassType`):
+	        The tokenizer used for encoding the data.
+	    padding (`Union[bool, str, `PaddingStrategy`]`, `optional`, defaults to `True`):
+	        padding_strategy to pass to the tokenizer.
+	    max_length (`int` or `None`, `optional`, defaults to `None`):
+	        If set will pad the sequence to a maximum provided value.
+	"""
+
+	tokenizer: ProcessingClassType
+	padding: tp.Union[bool, str] = "max_length"
+	max_length: tp.Optional[int] = None
+	truncation_mode: str = "keep_end"
+
+	def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+		features_chosen = []
+		features_rejected = []
+		margin = []
+		has_margin = "margin" in features[0]
+		for feature in features:
+			if (
+				"input_ids_chosen" not in feature
+				or "input_ids_rejected" not in feature
+				or "attention_mask_chosen" not in feature
+				or "attention_mask_rejected" not in feature
+			):
+				raise ValueError(
+					"The features should include `input_ids_chosen`, `attention_mask_chosen`, `input_ids_rejected` and `attention_mask_rejected`"
+				)
+
+			features_chosen.append(
+				{
+					"input_ids": feature["input_ids_chosen"],
+					"attention_mask": feature["attention_mask_chosen"],
+				}
+			)
+			features_rejected.append(
+				{
+					"input_ids": feature["input_ids_rejected"],
+					"attention_mask": feature["attention_mask_rejected"],
+				}
+			)
+			if has_margin:
+				margin.append(feature["margin"])
+		batch_chosen = self.tokenizer.pad(
+			features_chosen,
+			padding=self.padding,
+			max_length=self.max_length,
+			return_tensors="jax",
+		)
+		batch_rejected = self.tokenizer.pad(
+			features_rejected,
+			padding=self.padding,
+			max_length=self.max_length,
+			return_tensors="jax",
+		)
+		batch = {
+			"input_ids_chosen": batch_chosen["input_ids"],
+			"attention_mask_chosen": batch_chosen["attention_mask"],
+			"input_ids_rejected": batch_rejected["input_ids"],
+			"attention_mask_rejected": batch_rejected["attention_mask"],
+		}
+		if has_margin:
+			margin = jnp.array(margin, dtype="f4")
+			batch["margin"] = margin
 		return batch
 
 
@@ -884,6 +955,7 @@ def leave_alone_context_manager():
 def conversations_formatting_function(
 	processing_class: "AutoTokenizer",  # type:ignore #noqa
 	messages_field: tp.Literal["messages", "conversations"],
+	tools: tp.Optional[list] = None,
 ):
 	r"""
 	return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the processing_class
@@ -896,14 +968,18 @@ def conversations_formatting_function(
 			for i in range(len(examples[messages_field])):
 				output_texts.append(
 					processing_class.apply_chat_template(
-						examples[messages_field][i], tokenize=False
+						examples[messages_field][i],
+						tokenize=False,
+						tools=tools,
 					)
-				)  # type: ignore
+				)
 			return output_texts
 		else:
 			return processing_class.apply_chat_template(
-				examples[messages_field], tokenize=False
-			)  # type: ignore
+				examples[messages_field],
+				tokenize=False,
+				tools=tools,
+			)
 
 	return format_dataset
 
@@ -939,6 +1015,7 @@ def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type
 def get_formatting_func_from_dataset(
 	dataset: tp.Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
 	processing_class: "AutoTokenizer",  # type:ignore #noqa
+	tools: tp.Optional[list] = None,
 ) -> tp.Optional[tp.Callable]:
 	try:
 		from datasets import Dataset, Value
@@ -963,11 +1040,19 @@ def get_formatting_func_from_dataset(
 		if "messages" in dataset.features:
 			if dataset.features["messages"] == FORMAT_MAPPING["chatml"]:
 				logging.info("Formatting dataset with chatml format")
-				return conversations_formatting_function(processing_class, "messages")
+				return conversations_formatting_function(
+					processing_class,
+					"messages",
+					tools,
+				)
 		if "conversations" in dataset.features:
 			if dataset.features["conversations"] == FORMAT_MAPPING["chatml"]:
 				logging.info("Formatting dataset with chatml format")
-				return conversations_formatting_function(processing_class, "conversations")
+				return conversations_formatting_function(
+					processing_class,
+					"conversations",
+					tools,
+				)
 		elif dataset.features == FORMAT_MAPPING["instruction"]:
 			logging.info("Formatting dataset with instruction format")
 			return instructions_formatting_function(processing_class)
