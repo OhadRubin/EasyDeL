@@ -7,6 +7,6 @@ python3.11 -m venv ~/venv
 
 python get-pip.py
 pip install -U wheel
-
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[all]
 # sudo docker build -t easydel-base -f Dockerfile .
